@@ -1,14 +1,8 @@
 # Ignore contents of directories but keep the directories themselves
-processed_images/real_pairs/*
-!processed_images/real_pairs/.gitkeep
-processed_images/synthetic_pairs/*
-!processed_images/synthetic_pairs/.gitkeep
-scraped_images/real_pairs/*
-!scraped_images/real_pairs/.gitkeep
+processed_images/*
+scraped_images/*
 checkpoints/*
-!checkpoints/.gitkeep
 experiments/*
-!experiments/.gitkeep
 
 # Project files
 __pycache__/
