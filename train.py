@@ -172,17 +172,20 @@ def train_model(
                 color_imgs = color_imgs.to(device)
 
                 # Run forward pass with autocast
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):  # Updated to new style
                     # Generate colorized images
                     generated_imgs = generator(bw_imgs)
 
-                    # Calculate losses
+                    # Calculate losses that support fp16
                     l1 = l1_loss(generated_imgs, color_imgs)
                     perc = perceptual_loss(generated_imgs, color_imgs)
-                    color = color_hist_loss(generated_imgs, color_imgs)
 
-                    # Combine losses with weights
-                    total_loss = l1 + 0.1 * perc + 0.05 * color
+                # Calculate color histogram loss in fp32
+                with torch.cuda.amp.autocast(enabled=False):
+                    color = color_hist_loss(generated_imgs.float(), color_imgs.float())
+
+                # Combine losses with weights
+                total_loss = l1 + 0.1 * perc + 0.05 * color
 
                 # Update generator with gradient scaling
                 optimizer.zero_grad()
