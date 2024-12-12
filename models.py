@@ -249,14 +249,9 @@ class PerceptualLoss(nn.Module):
         x = (x - self.mean) / self.std
         target = (target - self.mean) / self.std
 
-        # Force float32 to avoid half precision issues
+        # Float32 to avoid half-precision issues
         x = x.float()
         target = target.float()
-
-        if torch.isnan(x).any() or torch.isnan(target).any():
-            print("DEBUG: NaN detected in inputs before VGG forward.")
-            print("DEBUG: x range:", x.min().item(), x.max().item())
-            print("DEBUG: target range:", target.min().item(), target.max().item())
 
         loss = 0
         style_loss = 0
@@ -265,16 +260,12 @@ class PerceptualLoss(nn.Module):
             x = block(x)
             with torch.no_grad():
                 t = block(target)
-            if torch.isnan(x).any() or torch.isnan(t).any():
-                print(f"DEBUG: NaN detected within VGG block {i}.")
-                print("DEBUG: x range:", x.min().item(), x.max().item())
-                print("DEBUG: target range:", t.min().item(), t.max().item())
+            target = t  # Update target here to keep channel alignment
+
             loss_val = F.mse_loss(x, t)
             style_val = F.mse_loss(self.gram_matrix(x), self.gram_matrix(t))
             if torch.isnan(loss_val) or torch.isnan(style_val):
                 print("DEBUG: NaN in Perceptual Loss computation.")
-                print("DEBUG: x Gram:", self.gram_matrix(x))
-                print("DEBUG: target Gram:", self.gram_matrix(t))
             loss += loss_val
             style_loss += style_val
 
@@ -301,13 +292,6 @@ class ColorHistogramLoss(nn.Module):
             pred_sum = pred_hist.sum()
             target_sum = target_hist.sum()
 
-            if torch.isnan(pred_hist).any() or torch.isnan(target_hist).any() or torch.isinf(pred_hist).any() or torch.isinf(target_hist).any():
-                print(f"DEBUG: NaN/Inf in histogram for channel {i}.")
-                print("DEBUG: pred_hist:", pred_hist)
-                print("DEBUG: target_hist:", target_hist)
-                print("DEBUG: pred_sum:", pred_sum.item(), "target_sum:", target_sum.item())
-
-            # Avoid division by zero
             if pred_sum == 0:
                 pred_sum = eps
             if target_sum == 0:
@@ -315,11 +299,6 @@ class ColorHistogramLoss(nn.Module):
 
             pred_hist = pred_hist / pred_sum
             target_hist = target_hist / target_sum
-
-            if torch.isnan(pred_hist).any() or torch.isnan(target_hist).any():
-                print(f"DEBUG: NaN after histogram normalization for channel {i}.")
-                print("DEBUG: pred_hist (normalized):", pred_hist)
-                print("DEBUG: target_hist (normalized):", target_hist)
 
             loss += F.l1_loss(pred_hist.cumsum(0), target_hist.cumsum(0))
 
@@ -336,15 +315,9 @@ class SemanticConsistencyLoss(nn.Module):
         b, c, h, w = generated.size()
         semantic_flat = F.normalize(semantic_features.view(b, -1, h * w), dim=1)
         colors_flat = generated.view(b, -1, h * w)
-
-        if torch.isnan(semantic_flat).any() or torch.isnan(colors_flat).any():
-            print("DEBUG: NaN detected in semantic/feature flattening.")
-
         color_sim = torch.bmm(colors_flat.transpose(1, 2), colors_flat)
         semantic_sim = torch.bmm(semantic_flat.transpose(1, 2), semantic_flat)
         loss = F.mse_loss(color_sim, semantic_sim)
-        if torch.isnan(loss).any():
-            print("DEBUG: NaN in Semantic Consistency Loss.")
         return loss
 
 
@@ -358,10 +331,6 @@ class ColorDiversityLoss(nn.Module):
         b, c, h, w = generated.size()
         pixels = generated.view(b, 3, -1).transpose(1, 2)
         distances = torch.cdist(pixels, pixels)
-        if torch.isnan(distances).any() or torch.isinf(distances).any():
-            print("DEBUG: NaN/Inf detected in cdist computation.")
         min_distances = distances.topk(k=self.num_clusters, dim=1, largest=False)[0]
         loss = -torch.mean(min_distances)
-        if torch.isnan(loss).any():
-            print("DEBUG: NaN in Color Diversity Loss.")
         return loss
