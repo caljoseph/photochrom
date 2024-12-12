@@ -227,6 +227,12 @@ class PerceptualLoss(nn.Module):
         x = (x - self.mean) / self.std
         target = (target - self.mean) / self.std
 
+        # Debugging statements for inputs to VGG
+        if torch.isnan(x).any() or torch.isnan(target).any():
+            print("DEBUG: NaN detected in inputs to VGG.")
+            print("DEBUG: x range:", x.min().item(), x.max().item())
+            print("DEBUG: target range:", target.min().item(), target.max().item())
+
         loss = 0
         style_loss = 0
 
@@ -234,8 +240,18 @@ class PerceptualLoss(nn.Module):
             x = block(x)
             with torch.no_grad():
                 target = block(target)
-            loss += F.mse_loss(x, target)
-            style_loss += F.mse_loss(self.gram_matrix(x), self.gram_matrix(target))
+            if torch.isnan(x).any() or torch.isnan(target).any():
+                print("DEBUG: NaN detected within VGG block.")
+                print("DEBUG: x range:", x.min().item(), x.max().item())
+                print("DEBUG: target range:", target.min().item(), target.max().item())
+            loss_val = F.mse_loss(x, target)
+            style_val = F.mse_loss(self.gram_matrix(x), self.gram_matrix(target))
+            if torch.isnan(loss_val) or torch.isnan(style_val):
+                print("DEBUG: NaN in Perceptual Loss computation.")
+                print("DEBUG: x Gram:", self.gram_matrix(x))
+                print("DEBUG: target Gram:", self.gram_matrix(target))
+            loss += loss_val
+            style_loss += style_val
 
         return loss + 0.3 * style_loss
 
@@ -258,7 +274,12 @@ class ColorHistogramLoss(nn.Module):
             pred_sum = pred_hist.sum()
             target_sum = target_hist.sum()
 
-            # Avoid division by zero
+            # Debugging statements for histogram values
+            if torch.isnan(pred_hist).any() or torch.isnan(target_hist).any():
+                print(f"DEBUG: NaN in histogram for channel {i}.")
+                print("DEBUG: pred_hist:", pred_hist)
+                print("DEBUG: target_hist:", target_hist)
+
             if pred_sum == 0:
                 pred_sum = eps
             if target_sum == 0:
@@ -266,6 +287,12 @@ class ColorHistogramLoss(nn.Module):
 
             pred_hist = pred_hist / pred_sum
             target_hist = target_hist / target_sum
+
+            # Check for NaN after normalization
+            if torch.isnan(pred_hist).any() or torch.isnan(target_hist).any():
+                print(f"DEBUG: NaN after histogram normalization for channel {i}.")
+                print("DEBUG: pred_hist (normalized):", pred_hist)
+                print("DEBUG: target_hist (normalized):", target_hist)
 
             loss += F.l1_loss(pred_hist.cumsum(0), target_hist.cumsum(0))
 
