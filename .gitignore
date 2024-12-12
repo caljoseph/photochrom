@@ -9,3 +9,9 @@ checkpoints/*
 !checkpoints/.gitkeep
 experiments/*
 !experiments/.gitkeep
+
+# Project files
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
