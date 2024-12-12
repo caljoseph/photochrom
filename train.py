@@ -11,20 +11,19 @@ from logger import TrainingLogger
 import os
 import random
 
-
 class PhotochromDataset(Dataset):
     def __init__(self, processed_dir, image_size=512):
         self.processed_dir = Path(processed_dir)
 
-        # Simple resize and normalization only
+        # Simple transforms - maintaining exact alignment
         self.transform = transforms.Compose([
-            transforms.Resize(image_size),
+            transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5], std=[0.5])
         ])
 
         self.color_transform = transforms.Compose([
-            transforms.Resize(image_size),
+            transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
         ])
@@ -43,7 +42,6 @@ class PhotochromDataset(Dataset):
         color_img = Image.open(color_path).convert('RGB')
 
         return self.transform(bw_img), self.color_transform(color_img)
-
 
 def validate_model(generator, val_loader, device, logger, epoch, step, num_samples=4):
     """Run validation and log results"""
@@ -95,7 +93,6 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
     generator.train()
     return val_metrics
 
-
 def train_model(
         train_dir="processed_images/synthetic_pairs",
         val_dir="processed_images/real_pairs",
@@ -103,14 +100,16 @@ def train_model(
         num_epochs=100,
         lr=0.0002,
         image_size=512,
-        device="cuda"
+        device=("cuda" if torch.cuda.is_available() else
+        "mps" if torch.backends.mps.is_available() else
+        "cpu")
 ):
     # Clear CUDA cache
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     # Create GradScaler for AMP
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = GradScaler()
 
     print(f"Using device: {device}")
     print(f"Starting training with batch size: {batch_size}")
@@ -172,7 +171,7 @@ def train_model(
                 color_imgs = color_imgs.to(device)
 
                 # Run forward pass with autocast
-                with torch.amp.autocast('cuda'):  # Updated to new style
+                with torch.amp.autocast('cuda'):
                     # Generate colorized images
                     generated_imgs = generator(bw_imgs)
 
@@ -262,7 +261,6 @@ def train_model(
     finally:
         # Final cleanup
         logger.close()
-
 
 if __name__ == "__main__":
     train_model()
