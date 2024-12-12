@@ -43,15 +43,17 @@ class PhotochromDataset(Dataset):
 
         return self.transform(bw_img), self.color_transform(color_img)
 
+
 def validate_model(generator, val_loader, device, logger, epoch, step, num_samples=4):
     """Run validation and log results"""
     generator.eval()
     val_metrics = {
-        'l1_loss': [],
-        'perceptual_loss': [],
-        'color_hist_loss': [],
-        'total_loss': []
+        'l1_loss': 0.0,
+        'perceptual_loss': 0.0,
+        'color_hist_loss': 0.0,
+        'total_loss': 0.0
     }
+    num_batches = 0
 
     l1_loss = nn.L1Loss()
     perceptual_loss = PerceptualLoss().to(device)
@@ -62,24 +64,36 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
     val_bw, val_color = val_batch[0][:num_samples].to(device), val_batch[1][:num_samples].to(device)
 
     with torch.no_grad():
+        # Log sample images
         val_generated = generator(val_bw)
-
-        # Calculate validation metrics
-        l1 = l1_loss(val_generated, val_color)
-        perc = perceptual_loss(val_generated, val_color)
-        color = color_hist_loss(val_generated, val_color)
-        total = l1 + 0.1 * perc + 0.05 * color
-
-        val_metrics['l1_loss'].append(l1.item())
-        val_metrics['perceptual_loss'].append(perc.item())
-        val_metrics['color_hist_loss'].append(color.item())
-        val_metrics['total_loss'].append(total.item())
-
-        # Log validation images
         logger.log_images(step, epoch, val_bw, val_generated, val_color)
+
+        # Calculate metrics over full validation set
+        for bw_imgs, color_imgs in val_loader:
+            bw_imgs = bw_imgs.to(device)
+            color_imgs = color_imgs.to(device)
+
+            generated_imgs = generator(bw_imgs)
+
+            l1 = l1_loss(generated_imgs, color_imgs)
+            perc = perceptual_loss(generated_imgs, color_imgs)
+            color = color_hist_loss(generated_imgs, color_imgs)
+            total = l1 + 0.1 * perc + 0.05 * color
+
+            val_metrics['l1_loss'] += l1.item()
+            val_metrics['perceptual_loss'] += perc.item()
+            val_metrics['color_hist_loss'] += color.item()
+            val_metrics['total_loss'] += total.item()
+
+            num_batches += 1
+
+    # Calculate averages
+    for k in val_metrics:
+        val_metrics[k] /= num_batches
 
     generator.train()
     return val_metrics
+
 
 def train_model(
         train_dir="processed_images/synthetic_pairs",
@@ -116,7 +130,7 @@ def train_model(
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
 
     val_dataset = PhotochromDataset(val_dir, image_size=image_size)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
 
     # Initialize models and losses
     generator = Generator().to(device)
@@ -177,21 +191,33 @@ def train_model(
                           f"L1: {l1.item():.4f}, Perc: {perc.item():.4f}, "
                           f"Color: {color.item():.4f}, Total: {total_loss.item():.4f}")
 
+                    # Log current metrics
+                    metrics = {
+                        'train': {
+                            'l1_loss': l1.item(),
+                            'perceptual_loss': perc.item(),
+                            'color_hist_loss': color.item(),
+                            'total_loss': total_loss.item()
+                        }
+                    }
+                    logger.log_metrics(i + epoch * len(train_loader), epoch, metrics)
+
             # End of epoch processing
             avg_loss = total_loss_epoch / num_batches
 
-            # Run validation with current step count
-            val_metrics = validate_model(generator, val_loader, device, logger, epoch, i)
+            # Run validation
+            val_metrics = validate_model(generator, val_loader, device, logger, epoch, i + epoch * len(train_loader))
 
             # Update learning rate
             scheduler.step(avg_loss)
 
-            # Log metrics
-            logger.log_metrics(i, epoch, {
-                'train_loss': avg_loss,
-                'val_metrics': val_metrics,
+            # Log end of epoch metrics
+            metrics = {
+                'train': {'epoch_loss': avg_loss},
+                'val': val_metrics,
                 'learning_rate': optimizer.param_groups[0]['lr']
-            })
+            }
+            logger.log_metrics(i + epoch * len(train_loader), epoch, metrics)
 
             # Save model checkpoint
             checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pth"
@@ -224,6 +250,7 @@ def train_model(
     finally:
         # Final cleanup
         logger.close()
+
 
 if __name__ == "__main__":
     train_model()
