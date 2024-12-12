@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from pathlib import Path
 from PIL import Image
+from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 from models import Generator, PerceptualLoss, ColorHistogramLoss
 from logger import TrainingLogger
@@ -98,14 +99,19 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
 def train_model(
         train_dir="processed_images/synthetic_pairs",
         val_dir="processed_images/real_pairs",
-        batch_size=32,
+        batch_size=96,
         num_epochs=100,
         lr=0.0002,
         image_size=512,
-        device=("cuda" if torch.cuda.is_available() else
-        "mps" if torch.backends.mps.is_available() else
-        "cpu")
+        device="cuda"
 ):
+    # Clear CUDA cache
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Create GradScaler for AMP
+    scaler = torch.cuda.amp.GradScaler()
+
     print(f"Using device: {device}")
     print(f"Starting training with batch size: {batch_size}")
 
@@ -165,21 +171,24 @@ def train_model(
                 bw_imgs = bw_imgs.to(device)
                 color_imgs = color_imgs.to(device)
 
-                # Generate colorized images
-                generated_imgs = generator(bw_imgs)
+                # Run forward pass with autocast
+                with torch.cuda.amp.autocast():
+                    # Generate colorized images
+                    generated_imgs = generator(bw_imgs)
 
-                # Calculate losses
-                l1 = l1_loss(generated_imgs, color_imgs)
-                perc = perceptual_loss(generated_imgs, color_imgs)
-                color = color_hist_loss(generated_imgs, color_imgs)
+                    # Calculate losses
+                    l1 = l1_loss(generated_imgs, color_imgs)
+                    perc = perceptual_loss(generated_imgs, color_imgs)
+                    color = color_hist_loss(generated_imgs, color_imgs)
 
-                # Combine losses with weights
-                total_loss = l1 + 0.1 * perc + 0.05 * color
+                    # Combine losses with weights
+                    total_loss = l1 + 0.1 * perc + 0.05 * color
 
-                # Update generator
+                # Update generator with gradient scaling
                 optimizer.zero_grad()
-                total_loss.backward()
-                optimizer.step()
+                scaler.scale(total_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
 
                 # Accumulate loss for epoch average
                 total_loss_epoch += total_loss.item()
