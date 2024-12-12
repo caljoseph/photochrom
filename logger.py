@@ -38,19 +38,8 @@ class TrainingLogger:
         # Initialize TensorBoard writer
         self.writer = SummaryWriter(self.tensorboard_dir)
 
-        # Store metrics
-        self.metrics = {
-            'step': [],
-            'epoch': [],
-            'train_l1_loss': [],
-            'train_perceptual_loss': [],
-            'train_color_hist_loss': [],
-            'train_total_loss': [],
-            'val_l1_loss': [],
-            'val_perceptual_loss': [],
-            'val_color_hist_loss': [],
-            'val_total_loss': []
-        }
+        # Initialize metrics storage
+        self.metrics_data = []
 
         # Save run metadata and hyperparameters
         self.save_metadata()
@@ -126,52 +115,65 @@ class TrainingLogger:
 
     def log_metrics(self, step, epoch, metrics_dict):
         """Log training metrics"""
-        # Update stored metrics
-        self.metrics['step'].append(step)
-        self.metrics['epoch'].append(epoch)
+        # Create a flat dictionary for this step's metrics
+        step_metrics = {
+            'step': step,
+            'epoch': epoch
+        }
 
-        for key, value in metrics_dict.items():
-            if isinstance(value, dict):  # Handle nested metrics
-                for sub_key, sub_value in value.items():
-                    full_key = f"val_{sub_key}"
-                    if full_key in self.metrics:
-                        self.metrics[full_key].append(sub_value)
-                        self.writer.add_scalar(f'Validation/{sub_key}', sub_value, step)
-            else:
-                if key in self.metrics:
-                    self.metrics[key].append(value)
-                    self.writer.add_scalar(f'Training/{key}', value, step)
+        # Process training metrics
+        if 'train' in metrics_dict:
+            for key, value in metrics_dict['train'].items():
+                step_metrics[f'train_{key}'] = value
 
-        # Save metrics to disk periodically
+        # Process validation metrics
+        if 'val' in metrics_dict:
+            for key, value in metrics_dict['val'].items():
+                step_metrics[f'val_{key}'] = value
+
+        # Add learning rate if present
+        if 'learning_rate' in metrics_dict:
+            step_metrics['learning_rate'] = metrics_dict['learning_rate']
+
+        # Store the metrics
+        self.metrics_data.append(step_metrics)
+
+        # Log to tensorboard
+        for key, value in step_metrics.items():
+            if key not in ['step', 'epoch']:
+                category = key.split('_')[0].capitalize()
+                metric_name = '_'.join(key.split('_')[1:])
+                self.writer.add_scalar(f'{category}/{metric_name}', value, step)
+
+        # Save metrics periodically
         if step % 1000 == 0:
             self.save_metrics()
             self.plot_loss_curves()
 
     def plot_loss_curves(self, save=True):
         """Plot training progress"""
+        if not self.metrics_data:
+            return
+
+        # Convert metrics to DataFrame for easier plotting
+        df = pd.DataFrame(self.metrics_data)
+
         plt.figure(figsize=(12, 8))
 
-        # Plot training losses
-        steps = self.metrics['step']
-
         # Plot training metrics
-        train_metrics = ['train_l1_loss', 'train_perceptual_loss', 'train_color_hist_loss', 'train_total_loss']
+        train_metrics = [col for col in df.columns if col.startswith('train_') and col.endswith('loss')]
         for metric in train_metrics:
-            if metric in self.metrics and len(self.metrics[metric]) > 0:
-                plt.plot(steps, self.metrics[metric], label=f"Train {metric.replace('train_', '')}", alpha=0.8)
+            plt.plot(df['step'], df[metric], label=f"Train {metric.replace('train_', '')}", alpha=0.8)
 
         # Plot validation metrics
-        val_metrics = ['val_l1_loss', 'val_perceptual_loss', 'val_color_hist_loss', 'val_total_loss']
+        val_metrics = [col for col in df.columns if col.startswith('val_') and col.endswith('loss')]
         for metric in val_metrics:
-            if metric in self.metrics and len(self.metrics[metric]) > 0:
-                plt.plot(steps, self.metrics[metric], label=f"Val {metric.replace('val_', '')}",
-                         linestyle='--', alpha=0.8)
+            plt.plot(df['step'], df[metric], label=f"Val {metric.replace('val_', '')}",
+                     linestyle='--', alpha=0.8)
 
         plt.xlabel('Step')
         plt.ylabel('Loss')
-        plt.title('Training Progress\n' +
-                  f"Loss Weights: {self.hyperparameters.get('loss_weights', 'Not specified')}")
-        # Only add legend if there are actual plots
+        plt.title('Training Progress')
         if len(plt.gca().get_lines()) > 0:
             plt.legend()
         plt.grid(True, alpha=0.3)
@@ -185,12 +187,16 @@ class TrainingLogger:
 
     def save_metrics(self):
         """Save metrics to disk"""
-        metrics_df = pd.DataFrame(self.metrics)
-        metrics_df.to_csv(self.run_dir / 'metrics.csv', index=False)
+        if not self.metrics_data:
+            return
 
-        # Also save as JSON for easier loading
+        # Save as CSV
+        df = pd.DataFrame(self.metrics_data)
+        df.to_csv(self.run_dir / 'metrics.csv', index=False)
+
+        # Save as JSON
         with open(self.run_dir / 'metrics.json', 'w') as f:
-            json.dump(self.metrics, f, indent=2)
+            json.dump(self.metrics_data, f, indent=2)
 
     def create_progress_summary(self):
         """Create a summary image showing progress throughout training"""
