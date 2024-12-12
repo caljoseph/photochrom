@@ -209,6 +209,10 @@ class PerceptualLoss(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
 
+        # ImageNet mean and std
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+
     def gram_matrix(self, x):
         b, c, h, w = x.size()
         features = x.view(b, c, h * w)
@@ -216,6 +220,14 @@ class PerceptualLoss(nn.Module):
         return gram.div(c * h * w)
 
     def forward(self, x, target):
+        # 1. Convert from [-1,1] to [0,1]
+        x = (x + 1) / 2
+        target = (target + 1) / 2
+
+        # 2. Apply ImageNet normalization
+        x = (x - self.mean) / self.std
+        target = (target - self.mean) / self.std
+
         loss = 0
         style_loss = 0
 
