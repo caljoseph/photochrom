@@ -173,10 +173,24 @@ class PhotochromLoss(nn.Module):
 
     def forward(self, generated, target, semantic_features):
         perceptual_loss = self.perceptual(generated, target)
+        if torch.isnan(perceptual_loss).any():
+            print("DEBUG: NaN detected in Perceptual Loss output.")
+
         color_hist_loss = self.color_hist(generated, target)
+        if torch.isnan(color_hist_loss).any():
+            print("DEBUG: NaN detected in Color Histogram Loss output.")
+
         semantic_loss = self.semantic_consistency(generated, semantic_features)
+        if torch.isnan(semantic_loss).any():
+            print("DEBUG: NaN detected in Semantic Consistency Loss output.")
+
         diversity_loss = self.color_diversity(generated)
+        if torch.isnan(diversity_loss).any():
+            print("DEBUG: NaN detected in Color Diversity Loss output.")
+
         ssim_loss = 1 - self.ssim(generated, target)
+        if torch.isnan(ssim_loss).any():
+            print("DEBUG: NaN detected in SSIM Loss output.")
 
         total_loss = (
             1.0 * perceptual_loss +
@@ -185,6 +199,14 @@ class PhotochromLoss(nn.Module):
             0.2 * diversity_loss +
             0.5 * ssim_loss
         )
+
+        if torch.isnan(total_loss).any():
+            print("DEBUG: NaN detected in total loss.")
+            print("DEBUG: perceptual_loss:", perceptual_loss)
+            print("DEBUG: color_hist_loss:", color_hist_loss)
+            print("DEBUG: semantic_loss:", semantic_loss)
+            print("DEBUG: diversity_loss:", diversity_loss)
+            print("DEBUG: ssim_loss:", ssim_loss)
 
         return {
             'total': total_loss,
@@ -227,29 +249,32 @@ class PerceptualLoss(nn.Module):
         x = (x - self.mean) / self.std
         target = (target - self.mean) / self.std
 
-        # Debugging statements for inputs to VGG
+        # Force float32 to avoid half precision issues
+        x = x.float()
+        target = target.float()
+
         if torch.isnan(x).any() or torch.isnan(target).any():
-            print("DEBUG: NaN detected in inputs to VGG.")
+            print("DEBUG: NaN detected in inputs before VGG forward.")
             print("DEBUG: x range:", x.min().item(), x.max().item())
             print("DEBUG: target range:", target.min().item(), target.max().item())
 
         loss = 0
         style_loss = 0
 
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             x = block(x)
             with torch.no_grad():
-                target = block(target)
-            if torch.isnan(x).any() or torch.isnan(target).any():
-                print("DEBUG: NaN detected within VGG block.")
+                t = block(target)
+            if torch.isnan(x).any() or torch.isnan(t).any():
+                print(f"DEBUG: NaN detected within VGG block {i}.")
                 print("DEBUG: x range:", x.min().item(), x.max().item())
-                print("DEBUG: target range:", target.min().item(), target.max().item())
-            loss_val = F.mse_loss(x, target)
-            style_val = F.mse_loss(self.gram_matrix(x), self.gram_matrix(target))
+                print("DEBUG: target range:", t.min().item(), t.max().item())
+            loss_val = F.mse_loss(x, t)
+            style_val = F.mse_loss(self.gram_matrix(x), self.gram_matrix(t))
             if torch.isnan(loss_val) or torch.isnan(style_val):
                 print("DEBUG: NaN in Perceptual Loss computation.")
                 print("DEBUG: x Gram:", self.gram_matrix(x))
-                print("DEBUG: target Gram:", self.gram_matrix(target))
+                print("DEBUG: target Gram:", self.gram_matrix(t))
             loss += loss_val
             style_loss += style_val
 
@@ -262,6 +287,8 @@ class ColorHistogramLoss(nn.Module):
         self.bins = bins
 
     def forward(self, pred, target):
+        pred = pred.float()
+        target = target.float()
         pred_lab = kc.rgb_to_lab(pred * 0.5 + 0.5)
         target_lab = kc.rgb_to_lab(target * 0.5 + 0.5)
 
@@ -274,12 +301,13 @@ class ColorHistogramLoss(nn.Module):
             pred_sum = pred_hist.sum()
             target_sum = target_hist.sum()
 
-            # Debugging statements for histogram values
-            if torch.isnan(pred_hist).any() or torch.isnan(target_hist).any():
-                print(f"DEBUG: NaN in histogram for channel {i}.")
+            if torch.isnan(pred_hist).any() or torch.isnan(target_hist).any() or torch.isinf(pred_hist).any() or torch.isinf(target_hist).any():
+                print(f"DEBUG: NaN/Inf in histogram for channel {i}.")
                 print("DEBUG: pred_hist:", pred_hist)
                 print("DEBUG: target_hist:", target_hist)
+                print("DEBUG: pred_sum:", pred_sum.item(), "target_sum:", target_sum.item())
 
+            # Avoid division by zero
             if pred_sum == 0:
                 pred_sum = eps
             if target_sum == 0:
@@ -288,7 +316,6 @@ class ColorHistogramLoss(nn.Module):
             pred_hist = pred_hist / pred_sum
             target_hist = target_hist / target_sum
 
-            # Check for NaN after normalization
             if torch.isnan(pred_hist).any() or torch.isnan(target_hist).any():
                 print(f"DEBUG: NaN after histogram normalization for channel {i}.")
                 print("DEBUG: pred_hist (normalized):", pred_hist)
@@ -304,12 +331,20 @@ class SemanticConsistencyLoss(nn.Module):
         super().__init__()
 
     def forward(self, generated, semantic_features):
+        generated = generated.float()
+        semantic_features = semantic_features.float()
         b, c, h, w = generated.size()
         semantic_flat = F.normalize(semantic_features.view(b, -1, h * w), dim=1)
         colors_flat = generated.view(b, -1, h * w)
+
+        if torch.isnan(semantic_flat).any() or torch.isnan(colors_flat).any():
+            print("DEBUG: NaN detected in semantic/feature flattening.")
+
         color_sim = torch.bmm(colors_flat.transpose(1, 2), colors_flat)
         semantic_sim = torch.bmm(semantic_flat.transpose(1, 2), semantic_flat)
         loss = F.mse_loss(color_sim, semantic_sim)
+        if torch.isnan(loss).any():
+            print("DEBUG: NaN in Semantic Consistency Loss.")
         return loss
 
 
@@ -319,9 +354,14 @@ class ColorDiversityLoss(nn.Module):
         self.num_clusters = num_clusters
 
     def forward(self, generated):
+        generated = generated.float()
         b, c, h, w = generated.size()
         pixels = generated.view(b, 3, -1).transpose(1, 2)
         distances = torch.cdist(pixels, pixels)
+        if torch.isnan(distances).any() or torch.isinf(distances).any():
+            print("DEBUG: NaN/Inf detected in cdist computation.")
         min_distances = distances.topk(k=self.num_clusters, dim=1, largest=False)[0]
         loss = -torch.mean(min_distances)
+        if torch.isnan(loss).any():
+            print("DEBUG: NaN in Color Diversity Loss.")
         return loss
