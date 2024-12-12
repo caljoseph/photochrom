@@ -98,7 +98,7 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
 def train_model(
         train_dir="processed_images/synthetic_pairs",
         val_dir="processed_images/real_pairs",
-        batch_size=8,
+        batch_size=32,
         num_epochs=100,
         lr=0.0002,
         image_size=512,
