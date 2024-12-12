@@ -209,7 +209,6 @@ class PerceptualLoss(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
 
-        # ImageNet mean and std
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
 
@@ -220,11 +219,11 @@ class PerceptualLoss(nn.Module):
         return gram.div(c * h * w)
 
     def forward(self, x, target):
-        # 1. Convert from [-1,1] to [0,1]
+        # Convert from [-1,1] to [0,1]
         x = (x + 1) / 2
         target = (target + 1) / 2
 
-        # 2. Apply ImageNet normalization
+        # ImageNet normalization
         x = (x - self.mean) / self.std
         target = (target - self.mean) / self.std
 
@@ -251,12 +250,22 @@ class ColorHistogramLoss(nn.Module):
         target_lab = kc.rgb_to_lab(target * 0.5 + 0.5)
 
         loss = 0
+        eps = 1e-8
         for i in range(3):
-            pred_hist = torch.histc(pred_lab[:, i, :, :], bins=self.bins)
-            target_hist = torch.histc(target_lab[:, i, :, :], bins=self.bins)
+            pred_hist = torch.histc(pred_lab[:, i, :, :], bins=self.bins, min=0.0, max=1.0)
+            target_hist = torch.histc(target_lab[:, i, :, :], bins=self.bins, min=0.0, max=1.0)
 
-            pred_hist = pred_hist / pred_hist.sum()
-            target_hist = target_hist / target_hist.sum()
+            pred_sum = pred_hist.sum()
+            target_sum = target_hist.sum()
+
+            # Avoid division by zero
+            if pred_sum == 0:
+                pred_sum = eps
+            if target_sum == 0:
+                target_sum = eps
+
+            pred_hist = pred_hist / pred_sum
+            target_hist = target_hist / target_sum
 
             loss += F.l1_loss(pred_hist.cumsum(0), target_hist.cumsum(0))
 
