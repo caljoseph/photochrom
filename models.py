@@ -2,33 +2,61 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torch.nn.functional as F
+from torchvision.models.segmentation import deeplabv3_resnet50
+import kornia.losses as kl
+import kornia.color as kc
 
 
 class SemanticEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        # Use ResNet18 pretrained for semantic feature extraction
-        resnet = models.resnet18(pretrained=True)
-        # Remove final layers, keep feature extraction
-        self.features = nn.Sequential(*list(resnet.children())[:-2])
-        # Freeze weights
+        self.semantic_net = deeplabv3_resnet50(pretrained=True)
+        self.features = self.semantic_net.backbone
         for param in self.features.parameters():
             param.requires_grad = False
 
     def forward(self, x):
-        # Handle grayscale input
         if x.size(1) == 1:
             x = x.repeat(1, 3, 1, 1)
-        return self.features(x)
+        return self.features(x)['out']
+
+
+class ColorPalette(nn.Module):
+    def __init__(self, num_colors=32, feature_dim=512):
+        super().__init__()
+        self.num_colors = num_colors
+        self.projection = nn.Linear(feature_dim, num_colors, bias=False)
+
+        initial_colors = torch.tensor([
+            [0.529, 0.808, 0.922],  # Sky blue
+            [0.196, 0.804, 0.196],  # Green
+            [0.545, 0.271, 0.075],  # Brown
+            [0.941, 0.902, 0.549],  # Sand
+            [0.608, 0.349, 0.714],  # Purple
+            [0.941, 0.196, 0.196],  # Red
+            [0.118, 0.565, 1.000],  # Deep blue
+            [0.827, 0.827, 0.827],  # Gray
+        ])
+        expanded_colors = torch.randn(num_colors - len(initial_colors), 3)
+        expanded_colors = torch.cat([initial_colors, expanded_colors])
+        self.color_embeddings = nn.Parameter(expanded_colors)
+
+    def forward(self, semantic_features):
+        b, c, h, w = semantic_features.size()
+        features_flat = semantic_features.view(b, c, h * w).permute(0, 2, 1)
+        attention = self.projection(features_flat)  # (B, H*W, num_colors)
+        attention = F.softmax(attention, dim=-1)
+        color_proposals = torch.matmul(attention, self.color_embeddings)  # (B, H*W, 3)
+        return color_proposals.permute(0, 2, 1).view(b, 3, h, w)
 
 
 class AttentionBlock(nn.Module):
-    def __init__(self, in_channels):
+    def __init__(self, channels):
         super().__init__()
         self.attention = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 8, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 8, in_channels, 1),
+            nn.Conv2d(channels, channels // 8, 1),
+            nn.LeakyReLU(0.2),
+            nn.Conv2d(channels // 8, channels, 1),
             nn.Sigmoid()
         )
 
@@ -40,107 +68,132 @@ class Generator(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # Semantic encoder
         self.semantic_encoder = SemanticEncoder()
+        self.color_palette = ColorPalette(num_colors=32, feature_dim=512)
 
-        # Encoder
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(1, 64, 4, stride=2, padding=1),  # 512 -> 256
+        # Texture encoder
+        self.texture_encoder = nn.Sequential(
+            nn.Conv2d(1, 64, 4, stride=2, padding=1),
+            nn.LeakyReLU(0.2),
+            self.encoder_block(64, 128),
+            self.encoder_block(128, 256),
+            self.encoder_block(256, 512)
+        )
+
+        # Semantic feature refinement
+        self.semantic_refine = nn.Sequential(
+            nn.Conv2d(2048, 512, 1),
+            nn.InstanceNorm2d(512),
             nn.LeakyReLU(0.2)
         )
-        self.enc2 = self.encoder_block(64, 128)  # 256 -> 128
-        self.enc3 = self.encoder_block(128, 256) # 128 -> 64
-        self.enc4 = self.encoder_block(256, 512) # 64 -> 32
 
-        # Attention blocks
-        self.attention1 = AttentionBlock(512)
-        self.attention2 = AttentionBlock(256)
+        # Color refinement decoder
+        self.color_decoder = nn.ModuleList([
+            self.decoder_block(1024, 256),
+            self.decoder_block(512, 128),
+            self.decoder_block(256, 64),
+            self.decoder_block(128, 32)
+        ])
 
-        # Decoder (adding an extra decoder block)
-        self.dec1 = self.decoder_block(512, 256)  # 32 -> 64
-        self.dec2 = self.decoder_block(512, 128)  # 64 -> 128
-        self.dec3 = self.decoder_block(256, 64)   # 128 -> 256
-        self.dec4 = self.decoder_block(128, 64)   # 256 -> 512 (new block)
-
-        # Adjust color refinement to handle 64 input channels now
-        self.color_adj = nn.Sequential(
-            nn.Conv2d(64, 64, 3, padding=1),
+        # Final color adjustment
+        self.final_adjust = nn.Sequential(
+            nn.Conv2d(32, 16, 3, padding=1),
             nn.LeakyReLU(0.2),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(32, 3, 3, padding=1),
+            nn.Conv2d(16, 3, 3, padding=1),
             nn.Tanh()
         )
+
+        # Region-aware attention
+        self.region_attention = nn.ModuleList([
+            AttentionBlock(256),
+            AttentionBlock(128),
+            AttentionBlock(64),
+            AttentionBlock(32)
+        ])
 
     def encoder_block(self, in_channels, out_channels):
         return nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 4, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.LeakyReLU(0.2)
         )
 
     def decoder_block(self, in_channels, out_channels):
         return nn.Sequential(
             nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU()
         )
 
     def forward(self, x):
-        # Extract semantic features
         semantic_features = self.semantic_encoder(x)
+        semantic_features = self.semantic_refine(semantic_features)
+        color_proposals = self.color_palette(semantic_features)
+        texture_features = self.texture_encoder(x)
 
-        # Encoder
-        e1 = self.enc1(x)   # 64@256x256
-        e2 = self.enc2(e1)  # 128@128x128
-        e3 = self.enc3(e2)  # 256@64x64
-        e4 = self.enc4(e3)  # 512@32x32
+        # Match spatial sizes
+        semantic_features = F.interpolate(
+            semantic_features,
+            size=(texture_features.size(2), texture_features.size(3)),
+            mode='bilinear',
+            align_corners=False
+        )
+        features = torch.cat([semantic_features, texture_features], dim=1)
 
-        # Attention on bottleneck
-        e4 = self.attention1(e4)
+        skip_connections = []
+        for i, decoder in enumerate(self.color_decoder):
+            features = decoder(features)
+            features = self.region_attention[i](features)
+            if i < len(self.color_decoder) - 1:
+                skip_connections.append(features)
+                features = torch.cat([features, skip_connections[-1]], dim=1)
 
-        # Decoder
-        d1 = self.dec1(e4)  # 256@64x64
-        d1 = self.attention2(d1)
-        d1 = torch.cat([d1, e3], 1)  # 512@64x64
+        output = self.final_adjust(features)
 
-        d2 = self.dec2(d1)  # 128@128x128
-        d2 = torch.cat([d2, e2], 1)  # 256@128x128
+        # Ensure color_proposals matches output size before combining
+        color_proposals = F.interpolate(
+            color_proposals,
+            size=(output.size(2), output.size(3)),
+            mode='bilinear',
+            align_corners=False
+        )
 
-        d3 = self.dec3(d2)  # 64@256x256
-        d3 = torch.cat([d3, e1], 1)  # 128@256x256
-
-        # New decoder step to get back to 512x512
-        d4 = self.dec4(d3)  # 64@512x512
-
-        # Final color refinement
-        return self.color_adj(d4)
+        final_output = output * 0.7 + color_proposals * 0.3
+        return final_output
 
 
-class ColorHistogramLoss(nn.Module):
-    def __init__(self, bins=64):
+class PhotochromLoss(nn.Module):
+    def __init__(self):
         super().__init__()
-        self.bins = bins
+        self.perceptual = PerceptualLoss()
+        self.color_hist = ColorHistogramLoss()
+        self.semantic_consistency = SemanticConsistencyLoss()
+        self.color_diversity = ColorDiversityLoss()
+        self.ssim = kl.SSIM(window_size=11, reduction='mean')
 
-    def forward(self, pred, target):
-        # Convert to Lab color space for better color comparison
-        pred = pred * 0.5 + 0.5  # Denormalize from [-1, 1] to [0, 1]
-        target = target * 0.5 + 0.5
+    def forward(self, generated, target, semantic_features):
+        perceptual_loss = self.perceptual(generated, target)
+        color_hist_loss = self.color_hist(generated, target)
+        semantic_loss = self.semantic_consistency(generated, semantic_features)
+        diversity_loss = self.color_diversity(generated)
+        ssim_loss = 1 - self.ssim(generated, target)
 
-        # Calculate histogram for each channel
-        loss = 0
-        for i in range(3):
-            pred_hist = torch.histc(pred[:, i, :, :], bins=self.bins, min=0, max=1)
-            target_hist = torch.histc(target[:, i, :, :], bins=self.bins, min=0, max=1)
+        total_loss = (
+            1.0 * perceptual_loss +
+            0.5 * color_hist_loss +
+            0.3 * semantic_loss +
+            0.2 * diversity_loss +
+            0.5 * ssim_loss
+        )
 
-            # Normalize histograms
-            pred_hist = pred_hist / pred_hist.sum()
-            target_hist = target_hist / target_hist.sum()
-
-            # Calculate Earth Mover's Distance
-            loss += F.l1_loss(pred_hist.cumsum(0), target_hist.cumsum(0))
-
-        return loss / 3.0
+        return {
+            'total': total_loss,
+            'perceptual': perceptual_loss,
+            'color_hist': color_hist_loss,
+            'semantic': semantic_loss,
+            'diversity': diversity_loss,
+            'ssim': ssim_loss
+        }
 
 
 class PerceptualLoss(nn.Module):
@@ -148,9 +201,10 @@ class PerceptualLoss(nn.Module):
         super().__init__()
         vgg = models.vgg16(pretrained=True).features
         self.blocks = nn.ModuleList([
-            vgg[:4],  # relu1_2
-            vgg[4:9],  # relu2_2
-            vgg[9:16],  # relu3_3
+            vgg[:4],
+            vgg[4:9],
+            vgg[9:16],
+            vgg[16:23]
         ])
         for param in self.parameters():
             param.requires_grad = False
@@ -164,14 +218,62 @@ class PerceptualLoss(nn.Module):
     def forward(self, x, target):
         loss = 0
         style_loss = 0
-        x = x.repeat(1, 1, 1, 1) if x.size(1) == 1 else x
-        target = target.repeat(1, 1, 1, 1) if target.size(1) == 1 else target
 
         for block in self.blocks:
             x = block(x)
-            target = block(target)
+            with torch.no_grad():
+                target = block(target)
             loss += F.mse_loss(x, target)
-            # Add style loss using gram matrices
             style_loss += F.mse_loss(self.gram_matrix(x), self.gram_matrix(target))
 
-        return loss + 0.5 * style_loss
+        return loss + 0.3 * style_loss
+
+
+class ColorHistogramLoss(nn.Module):
+    def __init__(self, bins=64):
+        super().__init__()
+        self.bins = bins
+
+    def forward(self, pred, target):
+        pred_lab = kc.rgb_to_lab(pred * 0.5 + 0.5)
+        target_lab = kc.rgb_to_lab(target * 0.5 + 0.5)
+
+        loss = 0
+        for i in range(3):
+            pred_hist = torch.histc(pred_lab[:, i, :, :], bins=self.bins)
+            target_hist = torch.histc(target_lab[:, i, :, :], bins=self.bins)
+
+            pred_hist = pred_hist / pred_hist.sum()
+            target_hist = target_hist / target_hist.sum()
+
+            loss += F.l1_loss(pred_hist.cumsum(0), target_hist.cumsum(0))
+
+        return loss / 3.0
+
+
+class SemanticConsistencyLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, generated, semantic_features):
+        b, c, h, w = generated.size()
+        semantic_flat = F.normalize(semantic_features.view(b, -1, h * w), dim=1)
+        colors_flat = generated.view(b, -1, h * w)
+        color_sim = torch.bmm(colors_flat.transpose(1, 2), colors_flat)
+        semantic_sim = torch.bmm(semantic_flat.transpose(1, 2), semantic_flat)
+        loss = F.mse_loss(color_sim, semantic_sim)
+        return loss
+
+
+class ColorDiversityLoss(nn.Module):
+    def __init__(self, num_clusters=8):
+        super().__init__()
+        self.num_clusters = num_clusters
+
+    def forward(self, generated):
+        b, c, h, w = generated.size()
+        pixels = generated.view(b, 3, -1).transpose(1, 2)
+        distances = torch.cdist(pixels, pixels)
+        min_distances = distances.topk(k=self.num_clusters, dim=1, largest=False)[0]
+        loss = -torch.mean(min_distances)
+        return loss
