@@ -2,335 +2,413 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 import torch.nn.functional as F
-from torchvision.models.segmentation import deeplabv3_resnet50
-import kornia.losses as kl
-import kornia.color as kc
+import numpy as np
 
+
+def debug_tensor(tensor, name, detailed=False):
+    """Enhanced debug function with distribution analysis and gradient handling"""
+    with torch.no_grad():  # Prevent gradient computation during debugging
+        # Detach tensor for stats computation
+        t = tensor.detach()
+
+        stats = {
+            "shape": t.shape,
+            "range": [t.min().item(), t.max().item()],
+            "mean": t.mean().item(),
+            "std": t.std().item()
+        }
+
+        if detailed:
+            # Analyze distribution
+            percentiles = torch.tensor([0, 25, 50, 75, 100], device=t.device)
+            stats["percentiles"] = torch.quantile(t.flatten(), percentiles / 100).cpu().numpy()
+
+            # Channel-wise stats for feature maps
+            if len(t.shape) == 4:
+                step = max(1, t.shape[1] // 4)  # Ensure step is at least 1
+                stats["channel_means"] = t.mean(dim=(0, 2, 3))[::step].cpu().numpy()
+
+        print(f"\n=== {name} ===")
+        print(f"Shape: {stats['shape']}")
+        print(f"Range: [{stats['range'][0]:.3f}, {stats['range'][1]:.3f}]")
+        print(f"Mean: {stats['mean']:.3f}, Std: {stats['std']:.3f}")
+
+        if detailed:
+            print(f"Percentiles (0,25,50,75,100): {stats['percentiles']}")
+            if len(t.shape) == 4:
+                print(f"Sample channel means: {stats['channel_means']}")
+
+        return stats
+
+
+class ColorAwareAttention(nn.Module):
+    """
+    Custom attention mechanism designed specifically for photochrom colorization.
+    Uses separate structural and color pathways with hierarchical region understanding.
+    """
+
+    def __init__(self, channels, debug=False):
+        super().__init__()
+        self.debug = debug
+        self.channels = channels
+
+        # Structure pathway
+        self.structure_proj = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.GroupNorm(8, channels // 4),
+            nn.GELU(),
+            nn.Conv2d(channels // 4, channels // 4, 3, padding=1, groups=channels // 32),
+            nn.GroupNorm(8, channels // 4),
+            nn.GELU()
+        )
+
+        # Color pathway
+        self.color_proj = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.GroupNorm(8, channels // 4),
+            nn.GELU(),
+            nn.Conv2d(channels // 4, channels // 4, 3, padding=1, groups=channels // 32),
+            nn.GroupNorm(8, channels // 4),
+            nn.GELU()
+        )
+
+        # Multi-scale region understanding
+        self.region_scales = [1, 2, 4]
+        self.region_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(channels // 4, channels // 4, kernel_size=3,
+                          padding=1, stride=scale),
+                nn.GroupNorm(8, channels // 4),
+                nn.GELU()
+            ) for scale in self.region_scales
+        ])
+
+        # Value projection
+        self.value = nn.Sequential(
+            nn.Conv2d(channels, channels, 1),
+            nn.GroupNorm(16, channels),
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels // 16),
+            nn.GroupNorm(16, channels),
+            nn.GELU()
+        )
+
+        # Output projection
+        self.out_proj = nn.Sequential(
+            nn.Conv2d(len(self.region_scales) * channels, channels, 1),
+            nn.GroupNorm(16, channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1)
+        )
+
+        self.scale = nn.Parameter(torch.ones(len(self.region_scales)))
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def _compute_region_attention(self, q, k, v, scale_idx):
+        B, C, H, W = q.shape
+
+        # Reshape all tensors to have compatible dimensions
+        q_flat = q.view(B, C, -1)  # B, C, HW
+        k_flat = k.view(B, C, -1)  # B, C, HW
+        v_flat = v.view(B, v.size(1), -1)  # B, C_v, HW
+
+        # Compute attention scores
+        attn = torch.bmm(q_flat.permute(0, 2, 1), k_flat)  # B, HW, HW
+        attn = attn * self.scale[scale_idx] / np.sqrt(C)
+        attn = F.softmax(attn, dim=-1)
+
+        if self.debug:
+            debug_tensor(attn, f"Attention Scale {scale_idx}")
+
+        # Apply attention
+        out = torch.bmm(v_flat, attn.permute(0, 2, 1))  # B, C_v, HW
+        return out.view(B, v.size(1), H, W)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+
+        if self.debug:
+            debug_tensor(x, "Attention Input")
+
+        # Extract structure and color features
+        struct_feats = self.structure_proj(x)
+        color_feats = self.color_proj(x)
+        value = self.value(x)
+
+        if self.debug:
+            debug_tensor(struct_feats, "Structure Features")
+            debug_tensor(color_feats, "Color Features")
+
+        # Multi-scale attention
+        outputs = []
+        for i, (scale, conv) in enumerate(zip(self.region_scales, self.region_convs)):
+            # Get regional features at current scale
+            q_struct = conv(struct_feats)
+            k_struct = conv(struct_feats)
+            q_color = conv(color_feats)
+
+            # Scale value features to match current resolution
+            current_h, current_w = H // scale, W // scale
+            v_scaled = F.interpolate(value, size=(current_h, current_w),
+                                     mode='bilinear', align_corners=False)
+
+            # Compute attention with dimension matching
+            struct_out = self._compute_region_attention(q_struct, k_struct, v_scaled, i)
+            color_out = self._compute_region_attention(q_color, k_struct, v_scaled, i)
+
+            # Return to original resolution
+            if scale > 1:
+                struct_out = F.interpolate(struct_out, size=(H, W),
+                                           mode='bilinear', align_corners=False)
+
+            outputs.append(struct_out)  # Only use structural attention output for simplicity
+
+        # Combine multi-scale outputs
+        combined = torch.cat(outputs, dim=1)
+        out = self.out_proj(combined)
+
+        return x + self.gamma * out
 
 class SemanticEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, debug=False):
         super().__init__()
-        self.semantic_net = deeplabv3_resnet50(pretrained=True)
-        self.features = self.semantic_net.backbone
-        for param in self.features.parameters():
+        self.debug = debug
+
+        resnet = models.resnet50(pretrained=True)
+        self.encoder = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2
+        )
+
+        self.projection = nn.Sequential(
+            nn.Conv2d(512, 512, 1),
+            nn.GroupNorm(16, 512),
+            nn.GELU(),
+            nn.Conv2d(512, 512, 3, padding=1, groups=16),
+            nn.GroupNorm(16, 512),
+            nn.GELU()
+        )
+
+        for param in self.encoder.parameters():
             param.requires_grad = False
 
     def forward(self, x):
         if x.size(1) == 1:
             x = x.repeat(1, 3, 1, 1)
-        return self.features(x)['out']
+
+        if self.debug:
+            debug_tensor(x, "Semantic Encoder Input")
+
+        features = self.encoder(x)
+        features = self.projection(features)
+
+        if self.debug:
+            debug_tensor(features, "Semantic Features", detailed=True)
+
+        return features
 
 
-class ColorPalette(nn.Module):
-    def __init__(self, num_colors=32, feature_dim=512):
+class UpsampleBlock(nn.Module):
+    def __init__(self, in_channels, skip_channels, out_channels, debug=False):
         super().__init__()
-        self.num_colors = num_colors
-        self.projection = nn.Linear(feature_dim, num_colors, bias=False)
+        self.debug = debug
 
-        initial_colors = torch.tensor([
-            [0.529, 0.808, 0.922],  # Sky blue
-            [0.196, 0.804, 0.196],  # Green
-            [0.545, 0.271, 0.075],  # Brown
-            [0.941, 0.902, 0.549],  # Sand
-            [0.608, 0.349, 0.714],  # Purple
-            [0.941, 0.196, 0.196],  # Red
-            [0.118, 0.565, 1.000],  # Deep blue
-            [0.827, 0.827, 0.827],  # Gray
-        ])
-        expanded_colors = torch.randn(num_colors - len(initial_colors), 3)
-        expanded_colors = torch.cat([initial_colors, expanded_colors])
-        self.color_embeddings = nn.Parameter(expanded_colors)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU()
+        )
 
-    def forward(self, semantic_features):
-        b, c, h, w = semantic_features.size()
-        features_flat = semantic_features.view(b, c, h * w).permute(0, 2, 1)
-        attention = self.projection(features_flat)  # (B, H*W, num_colors)
-        attention = F.softmax(attention, dim=-1)
-        color_proposals = torch.matmul(attention, self.color_embeddings)  # (B, H*W, 3)
-        return color_proposals.permute(0, 2, 1).view(b, 3, h, w)
+        self.residual = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=16),
+            nn.GroupNorm(8, out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=16),
+            nn.GroupNorm(8, out_channels)
+        )
 
-
-class AttentionBlock(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.attention = nn.Sequential(
-            nn.Conv2d(channels, channels // 8, 1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(channels // 8, channels, 1),
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_channels, out_channels // 4, 1),
+            nn.GELU(),
+            nn.Conv2d(out_channels // 4, out_channels, 1),
             nn.Sigmoid()
         )
 
-    def forward(self, x):
-        return x * self.attention(x)
+    def forward(self, x, skip):
+        if self.debug:
+            debug_tensor(x, "Upsample Input")
+            debug_tensor(skip, "Skip Connection")
+
+        x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = self.conv1(x)
+
+        residual = self.residual(x)
+        attention = self.channel_gate(residual)
+        out = x + residual * attention
+
+        if self.debug:
+            debug_tensor(out, "Upsample Output")
+
+        return out
 
 
 class Generator(nn.Module):
-    def __init__(self):
+    def __init__(self, debug=False):
         super().__init__()
+        self.debug = debug
+        init_channels = 48  # Base channel count
+        final_encoder_channels = init_channels * 8  # This will be 384
 
-        self.semantic_encoder = SemanticEncoder()
-        self.color_palette = ColorPalette(num_colors=32, feature_dim=512)
+        self.semantic_encoder = SemanticEncoder(debug=debug)
 
-        # Texture encoder
-        self.texture_encoder = nn.Sequential(
-            nn.Conv2d(1, 64, 4, stride=2, padding=1),
-            nn.LeakyReLU(0.2),
-            self.encoder_block(64, 128),
-            self.encoder_block(128, 256),
-            self.encoder_block(256, 512)
+        # Project semantic features to match encoder dimensions
+        self.semantic_projection = nn.Sequential(
+            nn.Conv2d(512, final_encoder_channels, 1),
+            nn.GroupNorm(16, final_encoder_channels),
+            nn.GELU()
         )
 
-        # Semantic feature refinement
-        self.semantic_refine = nn.Sequential(
-            nn.Conv2d(2048, 512, 1),
-            nn.InstanceNorm2d(512),
-            nn.LeakyReLU(0.2)
+        # Encoder
+        self.enc1 = nn.Sequential(
+            nn.Conv2d(1, init_channels, 7, padding=3),
+            nn.GroupNorm(8, init_channels),
+            nn.GELU()
         )
 
-        # Color refinement decoder
-        self.color_decoder = nn.ModuleList([
-            self.decoder_block(1024, 256),
-            self.decoder_block(512, 128),
-            self.decoder_block(256, 64),
-            self.decoder_block(128, 32)
-        ])
+        self.enc2 = nn.Sequential(
+            nn.Conv2d(init_channels, init_channels * 2, 4, stride=2, padding=1),
+            nn.GroupNorm(8, init_channels * 2),
+            nn.GELU()
+        )
 
-        # Final color adjustment
-        self.final_adjust = nn.Sequential(
-            nn.Conv2d(32, 16, 3, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(16, 3, 3, padding=1),
+        self.enc3 = nn.Sequential(
+            nn.Conv2d(init_channels * 2, init_channels * 4, 4, stride=2, padding=1),
+            nn.GroupNorm(8, init_channels * 4),
+            nn.GELU()
+        )
+
+        self.enc4 = nn.Sequential(
+            nn.Conv2d(init_channels * 4, final_encoder_channels, 4, stride=2, padding=1),
+            nn.GroupNorm(8, final_encoder_channels),
+            nn.GELU()
+        )
+
+        # Attention blocks
+        self.attention1 = ColorAwareAttention(init_channels * 8, debug=debug)
+        self.attention2 = ColorAwareAttention(init_channels * 4, debug=debug)
+
+        # Decoder
+        self.dec1 = UpsampleBlock(final_encoder_channels, init_channels * 4, init_channels * 4, debug=debug)
+        self.dec2 = UpsampleBlock(init_channels * 4, init_channels * 2, init_channels * 2, debug=debug)
+        self.dec3 = UpsampleBlock(init_channels * 2, init_channels, init_channels, debug=debug)
+
+        # Final output
+        self.final = nn.Sequential(
+            nn.Conv2d(init_channels, init_channels // 2, 3, padding=1),
+            nn.GroupNorm(8, init_channels // 2),
+            nn.GELU(),
+            nn.Conv2d(init_channels // 2, 3, 7, padding=3),
             nn.Tanh()
         )
 
-        # Region-aware attention
-        self.region_attention = nn.ModuleList([
-            AttentionBlock(256),
-            AttentionBlock(128),
-            AttentionBlock(64),
-            AttentionBlock(32)
-        ])
-
-    def encoder_block(self, in_channels, out_channels):
-        return nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 4, stride=2, padding=1),
-            nn.InstanceNorm2d(out_channels),
-            nn.LeakyReLU(0.2)
-        )
-
-    def decoder_block(self, in_channels, out_channels):
-        return nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1),
-            nn.InstanceNorm2d(out_channels),
-            nn.ReLU()
-        )
-
     def forward(self, x):
+        if self.debug:
+            debug_tensor(x, "Generator Input", detailed=True)
+
+        # Extract and project semantic features
         semantic_features = self.semantic_encoder(x)
-        semantic_features = self.semantic_refine(semantic_features)
-        color_proposals = self.color_palette(semantic_features)
-        texture_features = self.texture_encoder(x)
+        semantic_features = self.semantic_projection(semantic_features)
 
-        # Match spatial sizes
-        semantic_features = F.interpolate(
-            semantic_features,
-            size=(texture_features.size(2), texture_features.size(3)),
-            mode='bilinear',
-            align_corners=False
-        )
-        features = torch.cat([semantic_features, texture_features], dim=1)
+        # Encoder path
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
 
-        skip_connections = []
-        for i, decoder in enumerate(self.color_decoder):
-            features = decoder(features)
-            features = self.region_attention[i](features)
-            if i < len(self.color_decoder) - 1:
-                skip_connections.append(features)
-                features = torch.cat([features, skip_connections[-1]], dim=1)
+        if self.debug:
+            debug_tensor(e4, "Main Encoder Features", detailed=True)
+            debug_tensor(semantic_features, "Projected Semantic Features", detailed=True)
 
-        output = self.final_adjust(features)
+        # Feature fusion
+        e4 = e4 + semantic_features
 
-        # Ensure color_proposals matches output size before combining
-        color_proposals = F.interpolate(
-            color_proposals,
-            size=(output.size(2), output.size(3)),
-            mode='bilinear',
-            align_corners=False
-        )
+        if self.debug:
+            debug_tensor(e4, "Fused Features", detailed=True)
 
-        final_output = output * 0.7 + color_proposals * 0.3
-        return final_output
+        # Attention and decoder path
+        e4 = self.attention1(e4)
+        d1 = self.dec1(e4, e3)
+        d1 = self.attention2(d1)
+        d2 = self.dec2(d1, e2)
+        d3 = self.dec3(d2, e1)
 
+        out = self.final(d3)
 
-class PhotochromLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.perceptual = PerceptualLoss()
-        self.color_hist = ColorHistogramLoss()
-        self.semantic_consistency = SemanticConsistencyLoss()
-        self.color_diversity = ColorDiversityLoss()
-        self.ssim = kl.SSIM(window_size=11, reduction='mean')
+        if self.debug:
+            debug_tensor(out, "Final Output", detailed=True)
 
-    def forward(self, generated, target, semantic_features):
-        perceptual_loss = self.perceptual(generated, target)
-        if torch.isnan(perceptual_loss).any():
-            print("DEBUG: NaN detected in Perceptual Loss output.")
-
-        color_hist_loss = self.color_hist(generated, target)
-        if torch.isnan(color_hist_loss).any():
-            print("DEBUG: NaN detected in Color Histogram Loss output.")
-
-        semantic_loss = self.semantic_consistency(generated, semantic_features)
-        if torch.isnan(semantic_loss).any():
-            print("DEBUG: NaN detected in Semantic Consistency Loss output.")
-
-        diversity_loss = self.color_diversity(generated)
-        if torch.isnan(diversity_loss).any():
-            print("DEBUG: NaN detected in Color Diversity Loss output.")
-
-        ssim_loss = 1 - self.ssim(generated, target)
-        if torch.isnan(ssim_loss).any():
-            print("DEBUG: NaN detected in SSIM Loss output.")
-
-        total_loss = (
-            1.0 * perceptual_loss +
-            0.5 * color_hist_loss +
-            0.3 * semantic_loss +
-            0.2 * diversity_loss +
-            0.5 * ssim_loss
-        )
-
-        if torch.isnan(total_loss).any():
-            print("DEBUG: NaN detected in total loss.")
-            print("DEBUG: perceptual_loss:", perceptual_loss)
-            print("DEBUG: color_hist_loss:", color_hist_loss)
-            print("DEBUG: semantic_loss:", semantic_loss)
-            print("DEBUG: diversity_loss:", diversity_loss)
-            print("DEBUG: ssim_loss:", ssim_loss)
-
-        return {
-            'total': total_loss,
-            'perceptual': perceptual_loss,
-            'color_hist': color_hist_loss,
-            'semantic': semantic_loss,
-            'diversity': diversity_loss,
-            'ssim': ssim_loss
-        }
-
+        return out
 
 class PerceptualLoss(nn.Module):
     def __init__(self):
         super().__init__()
-        vgg = models.vgg16(pretrained=True).features
-        self.blocks = nn.ModuleList([
-            vgg[:4],
-            vgg[4:9],
-            vgg[9:16],
-            vgg[16:23]
-        ])
-        for param in self.parameters():
+        vgg = models.vgg16(pretrained=True).features[:23]
+        for param in vgg.parameters():
             param.requires_grad = False
+        self.vgg = vgg
+        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-        self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1,3,1,1))
-        self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1,3,1,1))
+    def normalize(self, x):
+        return (x * 0.5 + 0.5 - self.mean) / self.std
 
-    def gram_matrix(self, x):
-        b, c, h, w = x.size()
-        features = x.view(b, c, h * w)
-        gram = torch.bmm(features, features.transpose(1, 2))
-        return gram.div(c * h * w)
-
-    def forward(self, x, target):
-        # Convert from [-1,1] to [0,1]
-        x = (x + 1) / 2
-        target = (target + 1) / 2
-
-        # ImageNet normalization
-        x = (x - self.mean) / self.std
-        target = (target - self.mean) / self.std
-
-        # Float32 to avoid half-precision issues
-        x = x.float()
-        target = target.float()
-
-        loss = 0
-        style_loss = 0
-
-        for i, block in enumerate(self.blocks):
-            x = block(x)
-            with torch.no_grad():
-                t = block(target)
-            target = t  # Update target here to keep channel alignment
-
-            loss_val = F.mse_loss(x, t)
-            style_val = F.mse_loss(self.gram_matrix(x), self.gram_matrix(t))
-            if torch.isnan(loss_val) or torch.isnan(style_val):
-                print("DEBUG: NaN in Perceptual Loss computation.")
-            loss += loss_val
-            style_loss += style_val
-
-        return loss + 0.3 * style_loss
+    def forward(self, generated, target):
+        generated = self.normalize(generated)
+        target = self.normalize(target)
+        return F.mse_loss(self.vgg(generated), self.vgg(target))
 
 
 class ColorHistogramLoss(nn.Module):
     def __init__(self, bins=64):
         super().__init__()
         self.bins = bins
+        self.eps = 1e-8
 
-    def forward(self, pred, target):
-        pred = pred.float()
-        target = target.float()
-        pred_lab = kc.rgb_to_lab(pred * 0.5 + 0.5)
-        target_lab = kc.rgb_to_lab(target * 0.5 + 0.5)
+    def get_histogram(self, x):
+        x = (x + 1) / 2
+        x = torch.clamp(x, 0, 1)
 
-        loss = 0
-        eps = 1e-8
-        for i in range(3):
-            pred_hist = torch.histc(pred_lab[:, i, :, :], bins=self.bins, min=0.0, max=1.0)
-            target_hist = torch.histc(target_lab[:, i, :, :], bins=self.bins, min=0.0, max=1.0)
+        hist_list = []
+        for i in range(1, 3):  # a and b channels
+            hist = torch.histc(x[:, i].flatten(), bins=self.bins, min=0, max=1)
+            hist = hist + self.eps
+            hist = hist / hist.sum()
+            hist_list.append(hist)
 
-            pred_sum = pred_hist.sum()
-            target_sum = target_hist.sum()
+        return torch.cat(hist_list)
 
-            if pred_sum == 0:
-                pred_sum = eps
-            if target_sum == 0:
-                target_sum = eps
+    def forward(self, generated, target):
+        gen_hist = self.get_histogram(generated)
+        target_hist = self.get_histogram(target)
+        return F.kl_div((gen_hist + self.eps).log(), target_hist, reduction='batchmean')
 
-            pred_hist = pred_hist / pred_sum
-            target_hist = target_hist / target_sum
-
-            loss += F.l1_loss(pred_hist.cumsum(0), target_hist.cumsum(0))
-
-        return loss / 3.0
-
-
-class SemanticConsistencyLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, generated, semantic_features):
-        generated = generated.float()
-        semantic_features = semantic_features.float()
-        b, c, h, w = generated.size()
-        semantic_flat = F.normalize(semantic_features.view(b, -1, h * w), dim=1)
-        colors_flat = generated.view(b, -1, h * w)
-        color_sim = torch.bmm(colors_flat.transpose(1, 2), colors_flat)
-        semantic_sim = torch.bmm(semantic_flat.transpose(1, 2), semantic_flat)
-        loss = F.mse_loss(color_sim, semantic_sim)
-        return loss
-
-
-class ColorDiversityLoss(nn.Module):
-    def __init__(self, num_clusters=8):
-        super().__init__()
-        self.num_clusters = num_clusters
-
-    def forward(self, generated):
-        generated = generated.float()
-        b, c, h, w = generated.size()
-        pixels = generated.view(b, 3, -1).transpose(1, 2)
-        distances = torch.cdist(pixels, pixels)
-        min_distances = distances.topk(k=self.num_clusters, dim=1, largest=False)[0]
-        loss = -torch.mean(min_distances)
-        return loss
+# def get_recommended_hyperparameters():
+#     """Get recommended training hyperparameters"""
+#     return {
+#         'learning_rate': 2e-4,
+#         'batch_size': 1,  # For MPS, increase for CUDA
+#         'adam_betas': (0.5, 0.999),
+#         'lr_scheduler_patience': 3,
+#         'lr_scheduler_factor': 0.5,
+#         'loss_weights': {
+#             'l1': 1.0,
+#             'perceptual': 0.1,
+#             'color_histogram': 0.05
+#         },
+#         'gradient_clip_val': 1.0
+#     }

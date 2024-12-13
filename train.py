@@ -93,10 +93,11 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
     generator.train()
     return val_metrics
 
+
 def train_model(
         train_dir="processed_images/synthetic_pairs",
         val_dir="processed_images/real_pairs",
-        batch_size=96,
+        batch_size=1,
         num_epochs=100,
         lr=0.0002,
         image_size=512,
@@ -104,15 +105,11 @@ def train_model(
         "mps" if torch.backends.mps.is_available() else
         "cpu")
 ):
-    # Clear CUDA cache
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Create GradScaler for AMP
-    scaler = GradScaler()
-
     print(f"Using device: {device}")
     print(f"Starting training with batch size: {batch_size}")
+
+    # Only create GradScaler for CUDA
+    scaler = GradScaler() if device == "cuda" else None
 
     hyperparameters = {
         'loss_weights': {
@@ -132,13 +129,15 @@ def train_model(
 
     # Create datasets and dataloaders
     train_dataset = PhotochromDataset(train_dir, image_size=image_size)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=4 if device != "mps" else 0)  # MPS works better with 0 workers
 
     val_dataset = PhotochromDataset(val_dir, image_size=image_size)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=2 if device != "mps" else 0)
 
     # Initialize models and losses
-    generator = Generator().to(device)
+    generator = Generator(debug=True).to(device)
     perceptual_loss = PerceptualLoss().to(device)
     color_hist_loss = ColorHistogramLoss().to(device)
     l1_loss = nn.L1Loss()
@@ -157,7 +156,6 @@ def train_model(
         start_epoch = checkpoint['epoch'] + 1
         print(f"Resuming from epoch {start_epoch}")
 
-    # Optimizer with learning rate scheduling
     optimizer = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
@@ -170,39 +168,44 @@ def train_model(
                 bw_imgs = bw_imgs.to(device)
                 color_imgs = color_imgs.to(device)
 
-                # Run forward pass with autocast
-                with torch.amp.autocast('cuda'):
-                    # Generate colorized images
-                    generated_imgs = generator(bw_imgs)
+                # Device-specific forward pass handling
+                if device == "cuda":
+                    with torch.amp.autocast('cuda'):
+                        generated_imgs = generator(bw_imgs)
+                        l1 = l1_loss(generated_imgs, color_imgs)
+                        perc = perceptual_loss(generated_imgs, color_imgs)
 
-                    # Calculate losses that support fp16
+                    with torch.cuda.amp.autocast(enabled=False):
+                        color = color_hist_loss(generated_imgs.float(), color_imgs.float())
+                else:
+                    # Non-CUDA devices (CPU, MPS) - regular forward pass
+                    generated_imgs = generator(bw_imgs)
                     l1 = l1_loss(generated_imgs, color_imgs)
                     perc = perceptual_loss(generated_imgs, color_imgs)
-
-                # Calculate color histogram loss in fp32
-                with torch.cuda.amp.autocast(enabled=False):
-                    color = color_hist_loss(generated_imgs.float(), color_imgs.float())
+                    color = color_hist_loss(generated_imgs, color_imgs)
 
                 # Combine losses with weights
                 total_loss = l1 + 0.1 * perc + 0.05 * color
 
-                # Update generator with gradient scaling
+                # Update generator (with or without scaler)
                 optimizer.zero_grad()
-                scaler.scale(total_loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.scale(total_loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    total_loss.backward()
+                    optimizer.step()
 
-                # Accumulate loss for epoch average
+                # Rest of your training loop remains the same...
                 total_loss_epoch += total_loss.item()
                 num_batches += 1
 
-                # Log progress
                 if i % 100 == 0:
                     print(f"Epoch [{epoch}/{num_epochs}], Step [{i}/{len(train_loader)}], "
                           f"L1: {l1.item():.4f}, Perc: {perc.item():.4f}, "
                           f"Color: {color.item():.4f}, Total: {total_loss.item():.4f}")
 
-                    # Log current metrics
                     metrics = {
                         'train': {
                             'l1_loss': l1.item(),
@@ -259,7 +262,6 @@ def train_model(
         }, checkpoint_dir / "interrupted_checkpoint.pth")
 
     finally:
-        # Final cleanup
         logger.close()
 
 if __name__ == "__main__":
