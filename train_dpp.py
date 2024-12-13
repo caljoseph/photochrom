@@ -7,7 +7,8 @@ from torch.distributed import init_process_group, destroy_process_group
 from torchvision import transforms
 from pathlib import Path
 from PIL import Image
-from torch.cuda.amp import autocast, GradScaler
+# Update this import to use torch.amp instead of torch.cuda.amp
+from torch.amp import autocast, GradScaler
 import numpy as np
 from models import Generator, PerceptualLoss, ColorHistogramLoss
 from logger import TrainingLogger
@@ -169,7 +170,9 @@ def train_model_ddp(
 
     optimizer = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-    scaler = GradScaler('cuda')
+
+    # Initialize GradScaler without any arguments
+    scaler = GradScaler()
 
     try:
         for epoch in range(num_epochs):
@@ -181,16 +184,15 @@ def train_model_ddp(
                 bw_imgs = bw_imgs.to(rank)
                 color_imgs = color_imgs.to(rank)
 
-                # Calculate most losses with mixed precision
-                with torch.amp.autocast('cuda'):
+                # Use autocast with "cuda" device type
+                with autocast(device_type='cuda'):
                     generated_imgs = generator(bw_imgs)
                     l1 = l1_loss(generated_imgs, color_imgs)
                     perc = perceptual_loss(generated_imgs, color_imgs)
 
-                # Calculate color histogram loss in full precision
+                # Calculate color histogram loss in full precision outside autocast
                 color = color_hist_loss(generated_imgs.float(), color_imgs.float())
 
-                # Combine losses
                 total_loss = l1 + 0.1 * perc + 0.05 * color
 
                 optimizer.zero_grad()
