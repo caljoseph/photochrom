@@ -150,7 +150,7 @@ def train_model_ddp(
         train_dataset,
         batch_size=batch_size,
         sampler=train_sampler,
-        num_workers=1,  # Reduced workers for DDP
+        num_workers=1,
         pin_memory=True
     )
 
@@ -170,12 +170,32 @@ def train_model_ddp(
 
     optimizer = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-
-    # Initialize GradScaler without any arguments
     scaler = GradScaler()
 
+    # Set up checkpointing (only on rank 0)
+    start_epoch = 0
+    if rank == 0:
+        checkpoint_dir = Path("checkpoints")
+        checkpoint_dir.mkdir(exist_ok=True)
+        checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
+
+        if checkpoints:
+            latest_checkpoint = checkpoints[-1]
+            print(f"Loading checkpoint: {latest_checkpoint}")
+            checkpoint = torch.load(latest_checkpoint, map_location=f'cuda:{rank}')
+            generator.module.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"Resuming from epoch {start_epoch}")
+
+    # Broadcast start_epoch to all processes
+    start_epoch = torch.tensor(start_epoch, device=f'cuda:{rank}')
+    torch.distributed.broadcast(start_epoch, 0)
+    start_epoch = int(start_epoch.item())
+
     try:
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             train_sampler.set_epoch(epoch)
             total_loss_epoch = 0
             num_batches = 0
@@ -184,15 +204,12 @@ def train_model_ddp(
                 bw_imgs = bw_imgs.to(rank)
                 color_imgs = color_imgs.to(rank)
 
-                # Use autocast with "cuda" device type
                 with autocast(device_type='cuda'):
                     generated_imgs = generator(bw_imgs)
                     l1 = l1_loss(generated_imgs, color_imgs)
                     perc = perceptual_loss(generated_imgs, color_imgs)
 
-                # Calculate color histogram loss in full precision outside autocast
                 color = color_hist_loss(generated_imgs.float(), color_imgs.float())
-
                 total_loss = 0.5 * l1 + 0.3 * perc + 0.2 * color
 
                 optimizer.zero_grad()
@@ -218,12 +235,41 @@ def train_model_ddp(
                     }
                     logger.log_metrics(i + epoch * len(train_loader), epoch, metrics)
 
-            # Only perform validation and logging on main process
+            # Only perform validation, logging, and checkpointing on main process
             if rank == 0:
                 avg_loss = total_loss_epoch / num_batches
                 val_metrics = validate_model(generator, val_loader, rank, logger, epoch,
                                              i + epoch * len(train_loader))
                 scheduler.step(avg_loss)
+
+                # Save checkpoint
+                checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pth"
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': generator.module.state_dict(),  # Save the inner model's state
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'loss': avg_loss,
+                    'val_metrics': val_metrics,
+                }, checkpoint_path)
+
+                # Clean up old checkpoints (keep only the latest two)
+                old_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pth"))[:-2]
+                for ckpt in old_checkpoints:
+                    ckpt.unlink()
+
+                print(f"Completed epoch {epoch}, Average loss: {avg_loss:.4f}")
+
+    except KeyboardInterrupt:
+        if rank == 0:
+            print("\nTraining interrupted. Saving checkpoint...")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': generator.module.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'loss': total_loss.item(),
+            }, checkpoint_dir / "interrupted_checkpoint.pth")
 
     finally:
         destroy_process_group()
@@ -238,3 +284,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
