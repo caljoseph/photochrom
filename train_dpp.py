@@ -129,9 +129,9 @@ def train_model_ddp(
     # Only create logger on main process
     logger = TrainingLogger(hyperparameters={
         'loss_weights': {
-            'l1': 1.0,
-            'perceptual': 0.1,
-            'color_histogram': 0.05
+            'l1': 0.5,
+            'perceptual': 0.3,
+            'color_histogram': 0.2
         },
         'learning_rate': lr,
         'batch_size': batch_size * world_size,
@@ -193,7 +193,7 @@ def train_model_ddp(
                 # Calculate color histogram loss in full precision outside autocast
                 color = color_hist_loss(generated_imgs.float(), color_imgs.float())
 
-                total_loss = l1 + 0.1 * perc + 0.05 * color
+                total_loss = 0.5 * l1 + 0.3 * perc + 0.2 * color
 
                 optimizer.zero_grad()
                 scaler.scale(total_loss).backward()
