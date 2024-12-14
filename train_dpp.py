@@ -162,7 +162,7 @@ def train_model_ddp(
 
     # Initialize models and move to GPU
     generator = Generator(debug=False).to(rank)
-    generator = DDP(generator, device_ids=[rank])
+    generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
 
     perceptual_loss = PerceptualLoss().to(rank)
     color_hist_loss = ColorHistogramLoss().to(rank)
@@ -205,7 +205,8 @@ def train_model_ddp(
 
                 if rank == 0 and i % 100 == 0:
                     print(f"Epoch [{epoch}/{num_epochs}], Step [{i}/{len(train_loader)}], "
-                          f"Loss: {total_loss.item():.4f}")
+                          f"L1: {l1.item():.4f}, Perc: {perc.item():.4f}, "
+                          f"Color: {color.item():.4f}, Total: {total_loss.item():.4f}")
 
                     metrics = {
                         'train': {
