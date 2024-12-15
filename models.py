@@ -10,58 +10,104 @@ from debug_utils import MemoryTracker
 logger = logging.getLogger(__name__)
 
 
-class AttentionBlock(nn.Module):
-    """Self-attention block with memory tracking"""
+class EfficientAttentionBlock(nn.Module):
+    """Memory-efficient attention with local windows and reduced channel dimensions"""
 
-    def __init__(self, in_channels: int, tracker: Optional[MemoryTracker] = None):
+    def __init__(
+            self,
+            in_channels: int,
+            reduction_factor: int = 32,
+            window_size: int = 8,
+            stride: int = None
+    ):
         super().__init__()
         self.in_channels = in_channels
-        self.tracker = tracker
+        self.window_size = window_size
+        # Use input-dependent stride to handle different feature map sizes
+        self.stride = window_size if stride is None else stride
 
-        self.query = nn.Conv2d(in_channels, in_channels // 32, kernel_size=1)
-        self.key = nn.Conv2d(in_channels, in_channels // 32, kernel_size=1)
+        # Reduced channel dimensions for Q,K
+        self.query = nn.Conv2d(in_channels, in_channels // reduction_factor, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels // reduction_factor, kernel_size=1)
         self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+
+        # Learned scale parameter
         self.gamma = nn.Parameter(torch.zeros(1))
 
+        # Initialize weights
         for m in [self.query, self.key, self.value]:
             nn.init.kaiming_normal_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
+    def _extract_windows(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract local windows from input tensor"""
+        B, C, H, W = x.shape
+
+        # Pad input if needed
+        pad_h = (self.window_size - H % self.window_size) % self.window_size
+        pad_w = (self.window_size - W % self.window_size) % self.window_size
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+
+        # Extract windows using unfold
+        windows = x.unfold(2, self.window_size, self.stride) \
+            .unfold(3, self.window_size, self.stride)
+
+        # Reshape to (B, num_windows, C, window_size, window_size)
+        windows = windows.permute(0, 2, 3, 1, 4, 5) \
+            .reshape(-1, C, self.window_size, self.window_size)
+        return windows
+
+    def _merge_windows(self, windows: torch.Tensor, orig_size: tuple) -> torch.Tensor:
+        """Merge windows back to original feature map size"""
+        B, C, H, W = orig_size
+
+        # Calculate number of windows in each dimension
+        H_win = (H + self.stride - 1) // self.stride
+        W_win = (W + self.stride - 1) // self.stride
+
+        # Reshape windows back to feature map
+        windows = windows.view(B, H_win, W_win, C, self.window_size, self.window_size)
+        windows = windows.permute(0, 3, 1, 4, 2, 5)
+
+        # Handle padding if present
+        out = windows.reshape(B, C, H_win * self.window_size, W_win * self.window_size)
+        if out.size(2) > H or out.size(3) > W:
+            out = out[:, :, :H, :W]
+
+        return out
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.tracker:
-            self.tracker.log_tensor("attention_input", x)
-            self.tracker.log_memory("attention_start")
+        B, C, H, W = x.shape
 
-        batch_size, C, H, W = x.size()
+        # Extract windows
+        windows = self._extract_windows(x)
 
-        # Compute query, key, value transformations
-        query = self.query(x).view(batch_size, -1, H * W)
-        key = self.key(x).view(batch_size, -1, H * W)
-        value = self.value(x).view(batch_size, -1, H * W)
+        # Compute Q, K, V
+        q = self.query(windows)
+        k = self.key(windows)
+        v = self.value(windows)
 
-        if self.tracker:
-            self.tracker.log_tensor("attention_query", query)
-            self.tracker.log_tensor("attention_key", key)
-            self.tracker.log_tensor("attention_value", value)
-            self.tracker.log_memory("after_qkv_transform")
+        # Reshape for attention computation
+        Q = q.reshape(q.size(0), -1, self.window_size * self.window_size)
+        K = k.reshape(k.size(0), -1, self.window_size * self.window_size)
+        V = v.reshape(v.size(0), -1, self.window_size * self.window_size)
 
         # Compute attention scores
-        attention = torch.bmm(query.permute(0, 2, 1), key)
+        attn = torch.bmm(Q.transpose(1, 2), K)
+        attn = F.softmax(attn / (self.window_size * self.window_size) ** 0.5, dim=-1)
 
-        if self.tracker:
-            self.tracker.log_tensor("attention_scores", attention)
-            self.tracker.log_memory("after_attention_computation")
+        # Apply attention to values
+        out = torch.bmm(V, attn.transpose(1, 2))
 
-        attention = F.softmax(attention, dim=-1)
+        # Reshape back to windows
+        out = out.reshape(windows.size(0), C, self.window_size, self.window_size)
 
-        out = torch.bmm(value, attention.permute(0, 2, 1))
-        out = out.view(batch_size, C, H, W)
+        # Merge windows back to feature map
+        out = self._merge_windows(out, (B, C, H, W))
 
-        if self.tracker:
-            self.tracker.log_tensor("attention_output", out)
-            self.tracker.log_memory("attention_end")
-
+        # Apply learned scale and residual
         return self.gamma * out + x
 
 class UpsampleBlock(nn.Module):
@@ -202,10 +248,13 @@ class PhotochromGenerator(nn.Module):
 
         # Add attention blocks - pass tracker to each
         self.attention_blocks = nn.ModuleList([
-            AttentionBlock(dec_channels[0], tracker=tracker),
-            AttentionBlock(dec_channels[1], tracker=tracker),
-            AttentionBlock(dec_channels[2], tracker=tracker),
-            AttentionBlock(dec_channels[3], tracker=tracker)
+            # Early layers: larger windows for coarse features
+            EfficientAttentionBlock(dec_channels[0], window_size=16),
+            # Middle layers: medium windows
+            EfficientAttentionBlock(dec_channels[1], window_size=8),
+            # Later layers: smaller windows for fine details
+            EfficientAttentionBlock(dec_channels[2], window_size=8),
+            EfficientAttentionBlock(dec_channels[3], window_size=4)
         ])
 
         if self.tracker:
