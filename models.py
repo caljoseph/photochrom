@@ -418,10 +418,15 @@ class PerceptualLoss(nn.Module):
             print(f"Content loss: {c_loss.item():.4f}")
 
         if style_loss is not None:
-            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
-            style_loss = style_loss + s_loss
+            gram_input = self.gram_matrix(h_input)
+            gram_target = self.gram_matrix(h_target)
             if self.debug:
-                print(f"Style loss: {s_loss.item():.4f}")
+                print(f"Gram matrix ranges - Input: {gram_input.min():.4f} to {gram_input.max():.4f}")
+                print(f"Gram matrix ranges - Target: {gram_target.min():.4f} to {gram_target.max():.4f}")
+
+            s_loss = F.l1_loss(gram_input, gram_target)
+            s_loss = torch.clamp(s_loss, -100, 100)  # Prevent explosion
+            style_loss = style_loss + s_loss
 
         # Block 2 - Mid-level features
         if self.debug:
@@ -439,10 +444,15 @@ class PerceptualLoss(nn.Module):
             print(f"Content loss: {c_loss.item():.4f}")
 
         if style_loss is not None:
-            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
-            style_loss = style_loss + s_loss
+            gram_input = self.gram_matrix(h_input)
+            gram_target = self.gram_matrix(h_target)
             if self.debug:
-                print(f"Style loss: {s_loss.item():.4f}")
+                print(f"Gram matrix ranges - Input: {gram_input.min():.4f} to {gram_input.max():.4f}")
+                print(f"Gram matrix ranges - Target: {gram_target.min():.4f} to {gram_target.max():.4f}")
+
+            s_loss = F.l1_loss(gram_input, gram_target)
+            s_loss = torch.clamp(s_loss, -100, 100)  # Prevent explosion
+            style_loss = style_loss + s_loss
 
         # Block 3 - Higher-level features
         if self.debug:
@@ -460,10 +470,15 @@ class PerceptualLoss(nn.Module):
             print(f"Content loss: {c_loss.item():.4f}")
 
         if style_loss is not None:
-            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
-            style_loss = style_loss + s_loss
+            gram_input = self.gram_matrix(h_input)
+            gram_target = self.gram_matrix(h_target)
             if self.debug:
-                print(f"Style loss: {s_loss.item():.4f}")
+                print(f"Gram matrix ranges - Input: {gram_input.min():.4f} to {gram_input.max():.4f}")
+                print(f"Gram matrix ranges - Target: {gram_target.min():.4f} to {gram_target.max():.4f}")
+
+            s_loss = F.l1_loss(gram_input, gram_target)
+            s_loss = torch.clamp(s_loss, -100, 100)  # Prevent explosion
+            style_loss = style_loss + s_loss
 
         # Block 4 - Semantic features
         if self.debug:
@@ -481,10 +496,15 @@ class PerceptualLoss(nn.Module):
             print(f"Content loss: {c_loss.item():.4f}")
 
         if style_loss is not None:
-            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
-            style_loss = style_loss + s_loss
+            gram_input = self.gram_matrix(h_input)
+            gram_target = self.gram_matrix(h_target)
             if self.debug:
-                print(f"Style loss: {s_loss.item():.4f}")
+                print(f"Gram matrix ranges - Input: {gram_input.min():.4f} to {gram_input.max():.4f}")
+                print(f"Gram matrix ranges - Target: {gram_target.min():.4f} to {gram_target.max():.4f}")
+
+            s_loss = F.l1_loss(gram_input, gram_target)
+            s_loss = torch.clamp(s_loss, -100, 100)  # Prevent explosion
+            style_loss = style_loss + s_loss
 
         if self.debug:
             print(f"\nFinal content loss: {content_loss.item():.4f}")
@@ -498,11 +518,19 @@ class PerceptualLoss(nn.Module):
         return content_loss, None
 
     def gram_matrix(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute Gram matrix for style loss"""
+        """Compute Gram matrix with numerical stability"""
         B, C, H, W = x.shape
         features = x.view(B, C, -1)
-        gram = torch.bmm(features, features.transpose(1, 2))
-        return gram.div(C * H * W)
+
+        # Normalize features first
+        features_norm = F.normalize(features, dim=2)
+
+        # Compute Gram matrix
+        gram = torch.bmm(features_norm, features_norm.transpose(1, 2))
+
+        # Optional scaling if needed
+        scale = torch.tensor(1. / (C * H * W), device=x.device)
+        return gram * scale
 
 class ColorHistogramLoss(nn.Module):
     """Color histogram matching loss"""
