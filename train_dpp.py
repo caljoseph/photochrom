@@ -215,7 +215,7 @@ def train_model_ddp(
 
     # Initialize losses
     color_aware_loss = ColorAwareLoss().to(rank)
-    perceptual_loss = PerceptualLoss(style_weight=0.01).to(rank)
+    perceptual_loss = PerceptualLoss(style_weight=0.01, tracker=tracker).to(rank)
     color_hist_loss = ColorHistogramLoss().to(rank)
     tracker.log_memory("after_loss_init")
 

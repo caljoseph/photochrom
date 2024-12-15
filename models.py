@@ -345,10 +345,9 @@ def init_weights(model: nn.Module):
 
 
 class PerceptualLoss(nn.Module):
-    """VGG-based perceptual loss for training"""
-
-    def __init__(self, style_weight: float = 0.0):
+    def __init__(self, style_weight: float = 0.0, tracker: Optional[MemoryTracker] = None):
         super().__init__()
+        self.tracker = tracker
         vgg = models.vgg16(pretrained=True).features
         self.slices = nn.ModuleList([
             nn.Sequential(*list(vgg.children())[:4]),  # relu1_2
@@ -364,39 +363,45 @@ class PerceptualLoss(nn.Module):
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def gram_matrix(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.size()
-        features = x.view(b, c, h * w)
-        gram = torch.bmm(features, features.transpose(1, 2))
-        return gram.div(c * h * w)
-
-    def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.mean) / self.std
-
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Track input values
+        if self.tracker:
+            self.tracker.log_tensor("perceptual_input", input)
+            self.tracker.log_tensor("perceptual_target", target)
+
         input = self.normalize(input)
         target = self.normalize(target)
 
         content_loss = 0.0
         style_loss = 0.0
 
-        for slice in self.slices:
-            input = slice(input)
-            target = slice(target)
+        for idx, slice in enumerate(self.slices):
+            input_feat = slice(input)
+            target_feat = slice(target)
 
-            content_loss += F.l1_loss(input, target)
+            if self.tracker:
+                self.tracker.log_tensor(f"perceptual_slice_{idx}_input", input_feat)
+                self.tracker.log_tensor(f"perceptual_slice_{idx}_target", target_feat)
+
+            current_loss = F.l1_loss(input_feat, target_feat)
+            content_loss += current_loss
+
+            if self.tracker:
+                self.tracker.log_memory(f"perceptual_slice_{idx}_loss: {current_loss.item():.4f}")
 
             if self.style_weight > 0:
-                style_loss += F.l1_loss(
-                    self.gram_matrix(input),
-                    self.gram_matrix(target)
-                )
+                gram_input = self.gram_matrix(input_feat)
+                gram_target = self.gram_matrix(target_feat)
+                current_style_loss = F.l1_loss(gram_input, gram_target)
+                style_loss += current_style_loss
+
+                if self.tracker:
+                    self.tracker.log_memory(f"perceptual_slice_{idx}_style_loss: {current_style_loss.item():.4f}")
 
         if self.style_weight > 0:
             return content_loss + self.style_weight * style_loss, style_loss
 
         return content_loss, None
-
 
 class ColorHistogramLoss(nn.Module):
     """Color histogram matching loss"""
