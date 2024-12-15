@@ -164,13 +164,16 @@ class PhotochromGenerator(nn.Module):
         enc_channels = [256, 512, 1024, 2048]
         dec_channels = [256, 128, 64, 32]
 
-        # Create decoder stages
+        # Create decoder stages with proper upsampling
         self.decoder_stages = nn.ModuleList([
-            UpsampleBlock(enc_channels[3], dec_channels[0]),
-            UpsampleBlock(dec_channels[0] + enc_channels[2], dec_channels[1]),
-            UpsampleBlock(dec_channels[1] + enc_channels[1], dec_channels[2]),
-            UpsampleBlock(dec_channels[2] + enc_channels[0], dec_channels[3])
+            UpsampleBlock(enc_channels[3], dec_channels[0], scale_factor=2),
+            UpsampleBlock(dec_channels[0] + enc_channels[2], dec_channels[1], scale_factor=2),
+            UpsampleBlock(dec_channels[1] + enc_channels[1], dec_channels[2], scale_factor=2),
+            UpsampleBlock(dec_channels[2] + enc_channels[0], dec_channels[3], scale_factor=2)
         ])
+
+        # Add final upsampling to match input resolution
+        self.final_upsample = UpsampleBlock(dec_channels[3], dec_channels[3], scale_factor=2)
 
         # Add attention blocks after each decoder stage
         self.attention_blocks = nn.ModuleList([
@@ -198,19 +201,8 @@ class PhotochromGenerator(nn.Module):
         if debug:
             logger.setLevel(logging.DEBUG)
 
-    def _debug_shape(self, name: str, tensor: torch.Tensor):
-        """Helper to log tensor shapes during forward pass"""
-        if self.debug:
-            logger.debug(f"{name} shape: {tensor.shape}")
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of generator
-        Args:
-            x: Input tensor of shape (B, C, H, W)
-        Returns:
-            UV color channels of shape (B, 2, H, W)
-        """
+        """Forward pass of generator"""
         self._debug_shape("Input", x)
 
         # Store encoder outputs for skip connections
@@ -234,12 +226,19 @@ class PhotochromGenerator(nn.Module):
             x = attn(x)
             self._debug_shape(f"Attention {i}", x)
 
+        # Final upsampling to match input resolution
+        x = self.final_upsample(x)
+
         # Final output
         x = self.final(x)
         self._debug_shape("Output", x)
 
         return x
 
+    def _debug_shape(self, name: str, tensor: torch.Tensor):
+        """Helper to log tensor shapes during forward pass"""
+        if self.debug:
+            logger.debug(f"{name} shape: {tensor.shape}")
 
 def init_weights(model: nn.Module):
     """Initialize network weights using kaiming normal"""
