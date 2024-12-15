@@ -345,19 +345,19 @@ def init_weights(model: nn.Module):
 
 
 class PerceptualLoss(nn.Module):
-    """VGG-based perceptual loss with proper typing and memory management"""
+    """VGG-based perceptual loss for training"""
 
-    def __init__(self, style_weight: float = 0.0, tracker: Optional[MemoryTracker] = None):
+    def __init__(self, style_weight: float = 0.0):
         super().__init__()
-        self.tracker = tracker
         vgg = models.vgg16(pretrained=True).features
-        self.slices = nn.ModuleList([
-            nn.Sequential(*list(vgg.children())[:4]),  # relu1_2
-            nn.Sequential(*list(vgg.children())[4:9]),  # relu2_2
-            nn.Sequential(*list(vgg.children())[9:16]),  # relu3_3
-            nn.Sequential(*list(vgg.children())[16:23])  # relu4_3
-        ])
 
+        # Extract VGG blocks preserving hierarchical feature extraction
+        self.slice1 = nn.Sequential(*list(vgg.children())[:4])  # conv1_2
+        self.slice2 = nn.Sequential(*list(vgg.children())[4:9])  # conv2_2
+        self.slice3 = nn.Sequential(*list(vgg.children())[9:16])  # conv3_3
+        self.slice4 = nn.Sequential(*list(vgg.children())[16:23])  # conv4_3
+
+        # Freeze VGG parameters
         for param in self.parameters():
             param.requires_grad = False
 
@@ -365,55 +365,144 @@ class PerceptualLoss(nn.Module):
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize input tensor"""
-        return (x - self.mean.to(x.device)) / self.std.to(x.device)
+        self.debug = True
 
-    def gram_matrix(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.size()
-        features = x.view(b, c, h * w)
-        gram = torch.bmm(features, features.transpose(1, 2))
-        return gram.div(c * h * w)
+    def _normalize(self, x: torch.Tensor) -> torch.Tensor:
+        if self.debug:
+            print(f"Pre-normalization range: {x.min():.4f} to {x.max():.4f}")
+        normalized = (x - self.mean.to(x.device)) / self.std.to(x.device)
+        if self.debug:
+            print(f"Post-normalization range: {normalized.min():.4f} to {normalized.max():.4f}")
+        return normalized
 
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass computing content and optional style loss
+        """Forward pass computing perceptual and optional style loss
 
         Args:
-            input: Generated image tensor
-            target: Target image tensor
+            input: Generated image tensor [B, 3, H, W]
+            target: Ground truth image tensor [B, 3, H, W]
 
         Returns:
             Tuple of (content_loss, style_loss) where style_loss may be None
         """
-        if self.tracker:
-            self.tracker.log_tensor("perceptual_input", input)
-            self.tracker.log_tensor("perceptual_target", target)
+        if self.debug:
+            print(f"\nPerceptual Loss Debug:")
+            print(f"Input shape: {input.shape}, range: {input.min():.4f} to {input.max():.4f}")
+            print(f"Target shape: {target.shape}, range: {target.min():.4f} to {target.max():.4f}")
 
+        # Normalize inputs to VGG range
         input = self._normalize(input)
         target = self._normalize(target)
 
-        content_loss = torch.tensor(0.0, device=input.device, requires_grad=True)
-        style_loss = torch.tensor(0.0, device=input.device, requires_grad=True) if self.style_weight > 0 else None
+        # Initialize loss accumulators
+        content_loss = torch.tensor(0., device=input.device)
+        style_loss = torch.tensor(0., device=input.device) if self.style_weight > 0 else None
 
-        for idx, slice in enumerate(self.slices):
-            input_feat = slice(input)
-            target_feat = slice(target)
+        # Process through VGG blocks sequentially
+        h_input = input
+        h_target = target
 
-            if self.tracker:
-                self.tracker.log_tensor(f"vgg_feat_{idx}", input_feat)
+        # Block 1 - Low level features (edges, textures)
+        if self.debug:
+            print("\nBlock 1:")
+        h_input = self.slice1(h_input)
+        h_target = self.slice1(h_target)
+        if self.debug:
+            print(f"Feature shapes: {h_input.shape}")
+            print(f"Feature ranges - Input: {h_input.min():.4f} to {h_input.max():.4f}")
+            print(f"Feature ranges - Target: {h_target.min():.4f} to {h_target.max():.4f}")
 
-            content_loss = content_loss + F.l1_loss(input_feat, target_feat)
-
-            if style_loss is not None:
-                style_loss = style_loss + F.l1_loss(
-                    self.gram_matrix(input_feat),
-                    self.gram_matrix(target_feat)
-                )
+        c_loss = F.l1_loss(h_input, h_target)
+        content_loss = content_loss + c_loss
+        if self.debug:
+            print(f"Content loss: {c_loss.item():.4f}")
 
         if style_loss is not None:
-            return content_loss, style_loss
+            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
+            style_loss = style_loss + s_loss
+            if self.debug:
+                print(f"Style loss: {s_loss.item():.4f}")
+
+        # Block 2 - Mid-level features
+        if self.debug:
+            print("\nBlock 2:")
+        h_input = self.slice2(h_input)
+        h_target = self.slice2(h_target)
+        if self.debug:
+            print(f"Feature shapes: {h_input.shape}")
+            print(f"Feature ranges - Input: {h_input.min():.4f} to {h_input.max():.4f}")
+            print(f"Feature ranges - Target: {h_target.min():.4f} to {h_target.max():.4f}")
+
+        c_loss = F.l1_loss(h_input, h_target)
+        content_loss = content_loss + c_loss
+        if self.debug:
+            print(f"Content loss: {c_loss.item():.4f}")
+
+        if style_loss is not None:
+            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
+            style_loss = style_loss + s_loss
+            if self.debug:
+                print(f"Style loss: {s_loss.item():.4f}")
+
+        # Block 3 - Higher-level features
+        if self.debug:
+            print("\nBlock 3:")
+        h_input = self.slice3(h_input)
+        h_target = self.slice3(h_target)
+        if self.debug:
+            print(f"Feature shapes: {h_input.shape}")
+            print(f"Feature ranges - Input: {h_input.min():.4f} to {h_input.max():.4f}")
+            print(f"Feature ranges - Target: {h_target.min():.4f} to {h_target.max():.4f}")
+
+        c_loss = F.l1_loss(h_input, h_target)
+        content_loss = content_loss + c_loss
+        if self.debug:
+            print(f"Content loss: {c_loss.item():.4f}")
+
+        if style_loss is not None:
+            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
+            style_loss = style_loss + s_loss
+            if self.debug:
+                print(f"Style loss: {s_loss.item():.4f}")
+
+        # Block 4 - Semantic features
+        if self.debug:
+            print("\nBlock 4:")
+        h_input = self.slice4(h_input)
+        h_target = self.slice4(h_target)
+        if self.debug:
+            print(f"Feature shapes: {h_input.shape}")
+            print(f"Feature ranges - Input: {h_input.min():.4f} to {h_input.max():.4f}")
+            print(f"Feature ranges - Target: {h_target.min():.4f} to {h_target.max():.4f}")
+
+        c_loss = F.l1_loss(h_input, h_target)
+        content_loss = content_loss + c_loss
+        if self.debug:
+            print(f"Content loss: {c_loss.item():.4f}")
+
+        if style_loss is not None:
+            s_loss = F.l1_loss(self.gram_matrix(h_input), self.gram_matrix(h_target))
+            style_loss = style_loss + s_loss
+            if self.debug:
+                print(f"Style loss: {s_loss.item():.4f}")
+
+        if self.debug:
+            print(f"\nFinal content loss: {content_loss.item():.4f}")
+            if style_loss is not None:
+                print(f"Final style loss: {style_loss.item():.4f}")
+
+        # Return both content and style loss
+        if style_loss is not None:
+            return content_loss + self.style_weight * style_loss, style_loss
 
         return content_loss, None
+
+    def gram_matrix(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute Gram matrix for style loss"""
+        B, C, H, W = x.shape
+        features = x.view(B, C, -1)
+        gram = torch.bmm(features, features.transpose(1, 2))
+        return gram.div(C * H * W)
 
 class ColorHistogramLoss(nn.Module):
     """Color histogram matching loss"""
