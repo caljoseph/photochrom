@@ -9,6 +9,8 @@ from pathlib import Path
 from PIL import Image
 from torch.amp import autocast, GradScaler
 import numpy as np
+
+from debug_utils import MemoryTracker
 from models import PhotochromGenerator, PerceptualLoss, ColorHistogramLoss, ColorAwareLoss, rgb_to_yuv, yuv_to_rgb
 from logger import TrainingLogger
 import os
@@ -143,13 +145,20 @@ def train_model_ddp(
         world_size: int,
         train_dir: str = "processed_images/synthetic_pairs",
         val_dir: str = "processed_images/real_pairs",
-        batch_size: int = 1,  # Starting with batch_size 1 as discussed
+        batch_size: int = 1,
         num_epochs: int = 100,
         lr: float = 0.0002,
         image_size: int = 512,
 ):
-    """Distributed training implementation with color-space aware processing"""
     setup_ddp(rank, world_size)
+
+    # Initialize memory tracker for this rank
+    tracker = MemoryTracker(
+        rank=rank,
+        log_dir=f"memory_logs/rank_{rank}"
+    )
+    tracker.reset_peak_memory()
+    tracker.log_memory("training_start")
 
     # Initialize logger on main process only
     logger = TrainingLogger(hyperparameters={
@@ -180,6 +189,8 @@ def train_model_ddp(
         pin_memory=True
     )
 
+    tracker.log_memory("after_dataloader_init")
+
     # Validation loader only on main process
     val_loader = None
     if rank == 0:
@@ -191,16 +202,23 @@ def train_model_ddp(
             num_workers=1
         )
 
-    # Initialize models and move to GPU
-    generator = PhotochromGenerator(pretrained=True, debug=(rank == 0)).to(rank)
-    generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
+    # Initialize models with memory tracking
+    tracker.log_memory("before_model_init")
+    generator = PhotochromGenerator(
+        pretrained=True,
+        debug=(rank == 0),
+        tracker=tracker  # Pass tracker to the model
+    ).to(rank)
+
+    generator = DDP(generator, device_ids=[rank], find_unused_parameters=False)  # Removed find_unused_parameters
+    tracker.log_memory("after_model_init")
 
     # Initialize losses
     color_aware_loss = ColorAwareLoss().to(rank)
     perceptual_loss = PerceptualLoss(style_weight=0.01).to(rank)
     color_hist_loss = ColorHistogramLoss().to(rank)
+    tracker.log_memory("after_loss_init")
 
-    # Initialize optimizer and scheduler
     optimizer = torch.optim.AdamW(
         generator.parameters(),
         lr=lr,
@@ -215,8 +233,9 @@ def train_model_ddp(
     )
 
     scaler = GradScaler('cuda')
+    tracker.log_memory("after_optimizer_init")
 
-    # Set up checkpointing (only on rank 0)
+    # Load checkpoint if exists
     start_epoch = 0
     if rank == 0:
         checkpoint_dir = Path("checkpoints")
@@ -240,29 +259,48 @@ def train_model_ddp(
 
     try:
         for epoch in range(start_epoch, num_epochs):
+            tracker.reset_peak_memory()
+            tracker.log_memory(f"epoch_{epoch}_start")
+
             train_sampler.set_epoch(epoch)
             total_loss_epoch = 0
             num_batches = 0
 
             for i, (bw_imgs, color_imgs) in enumerate(train_loader):
+                if i % 100 == 0:  # Log memory periodically
+                    tracker.log_memory(f"epoch_{epoch}_step_{i}_start")
+
                 bw_imgs = bw_imgs.to(rank)
                 color_imgs = color_imgs.to(rank)
+
+                if i % 100 == 0:
+                    tracker.log_tensor("input_images", bw_imgs)
+                    tracker.log_tensor("target_images", color_imgs)
 
                 with autocast(device_type='cuda'):
                     # Generate UV channels
                     generated_uv = generator(bw_imgs)
+                    if i % 100 == 0:
+                        tracker.log_tensor("generated_uv", generated_uv)
+                        tracker.log_memory("after_generator")
 
-                    # Combine with Y channel and convert to RGB for loss calculation
+                    # Combine with Y channel and convert to RGB
                     y_channel = bw_imgs[:, 0:1]
                     generated_yuv = torch.cat([y_channel, generated_uv], dim=1)
                     generated_rgb = yuv_to_rgb(generated_yuv)
+
+                    if i % 100 == 0:
+                        tracker.log_tensor("generated_rgb", generated_rgb)
+                        tracker.log_memory("after_color_conversion")
 
                     # Calculate losses
                     l1 = color_aware_loss(generated_uv, color_imgs)
                     perc, style_loss = perceptual_loss(generated_rgb, color_imgs)
                     color = color_hist_loss(generated_rgb, color_imgs)
 
-                    # Combine losses
+                    if i % 100 == 0:
+                        tracker.log_memory("after_loss_computation")
+
                     total_loss = (
                             l1 +
                             0.1 * perc +
@@ -271,9 +309,21 @@ def train_model_ddp(
                     )
 
                 optimizer.zero_grad()
+
+                if i % 100 == 0:
+                    tracker.log_memory("before_backward")
+
                 scaler.scale(total_loss).backward()
+
+                if i % 100 == 0:
+                    tracker.log_memory("after_backward")
+
                 scaler.step(optimizer)
                 scaler.update()
+
+                if i % 100 == 0:
+                    tracker.log_memory("after_optimizer_step")
+                    tracker.clear_cache()  # Clear cache periodically
 
                 total_loss_epoch += total_loss.item()
                 num_batches += 1
@@ -293,6 +343,8 @@ def train_model_ddp(
                         }
                     }
                     logger.log_metrics(i + epoch * len(train_loader), epoch, metrics)
+
+            tracker.log_memory(f"epoch_{epoch}_end")
 
             # Only perform validation, logging, and checkpointing on main process
             if rank == 0:
@@ -344,8 +396,10 @@ def train_model_ddp(
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': total_loss.item(),
             }, checkpoint_dir / "interrupted_checkpoint.pth")
-
     finally:
+        # Save final memory report
+        tracker.save_final_report()
+        tracker.report_memory_leak()
         destroy_process_group()
 
 

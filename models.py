@@ -5,53 +5,63 @@ import torchvision.models as models
 from typing import List, Tuple, Optional
 import logging
 
+from debug_utils import MemoryTracker
+
 logger = logging.getLogger(__name__)
 
 
 class AttentionBlock(nn.Module):
-    """Efficient self-attention block optimized for GPU training"""
+    """Self-attention block with memory tracking"""
 
-    def __init__(self, in_channels: int):
+    def __init__(self, in_channels: int, tracker: Optional[MemoryTracker] = None):
         super().__init__()
         self.in_channels = in_channels
+        self.tracker = tracker
+
         self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
         self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
         self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.gamma = nn.Parameter(torch.zeros(1))
 
-        # Initialize weights
         for m in [self.query, self.key, self.value]:
             nn.init.kaiming_normal_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.tracker:
+            self.tracker.log_tensor("attention_input", x)
+            self.tracker.log_memory("attention_start")
+
         batch_size, C, H, W = x.size()
 
         # Compute query, key, value transformations
-        query = self.query(x).view(batch_size, -1, H * W)  # B x C' x N
-        key = self.key(x).view(batch_size, -1, H * W)  # B x C' x N
-        value = self.value(x).view(batch_size, -1, H * W)  # B x C x N
+        query = self.query(x).view(batch_size, -1, H * W)
+        key = self.key(x).view(batch_size, -1, H * W)
+        value = self.value(x).view(batch_size, -1, H * W)
+
+        if self.tracker:
+            self.tracker.log_tensor("attention_query", query)
+            self.tracker.log_tensor("attention_key", key)
+            self.tracker.log_tensor("attention_value", value)
+            self.tracker.log_memory("after_qkv_transform")
 
         # Compute attention scores
-        attention = torch.bmm(
-            query.permute(0, 2, 1),  # B x N x C'
-            key  # B x C' x N
-        )  # B x N x N
+        attention = torch.bmm(query.permute(0, 2, 1), key)
 
-        # Normalize attention scores
+        if self.tracker:
+            self.tracker.log_tensor("attention_scores", attention)
+            self.tracker.log_memory("after_attention_computation")
+
         attention = F.softmax(attention, dim=-1)
 
-        # Apply attention to value
-        out = torch.bmm(
-            value,  # B x C x N
-            attention.permute(0, 2, 1)  # B x N x N
-        )  # B x C x N
-
-        # Reshape back to spatial dimensions
+        out = torch.bmm(value, attention.permute(0, 2, 1))
         out = out.view(batch_size, C, H, W)
 
-        # Apply learnable scaling factor and residual connection
+        if self.tracker:
+            self.tracker.log_tensor("attention_output", out)
+            self.tracker.log_memory("attention_end")
+
         return self.gamma * out + x
 
 class UpsampleBlock(nn.Module):
