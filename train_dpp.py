@@ -7,52 +7,70 @@ from torch.distributed import init_process_group, destroy_process_group
 from torchvision import transforms
 from pathlib import Path
 from PIL import Image
-# Update this import to use torch.amp instead of torch.cuda.amp
 from torch.amp import autocast, GradScaler
 import numpy as np
-from models import Generator, PerceptualLoss, ColorHistogramLoss
+from models import PhotochromGenerator, PerceptualLoss, ColorHistogramLoss, ColorAwareLoss, rgb_to_yuv, yuv_to_rgb
 from logger import TrainingLogger
 import os
 import random
 
 
-# Your original PhotochromDataset unchanged
 class PhotochromDataset(Dataset):
-    def __init__(self, processed_dir, image_size=512):
+    """Dataset for paired BW and photochrom images"""
+
+    def __init__(self, processed_dir: str, image_size: int = 512, augment: bool = True):
         self.processed_dir = Path(processed_dir)
+        self.augment = augment
 
-        # Simple transforms - maintaining exact alignment
-        self.transform = transforms.Compose([
+        # Core transforms
+        self.core_transform = transforms.Compose([
             transforms.Resize((image_size, image_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5], std=[0.5])
         ])
 
-        self.color_transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
+        # Normalization for pretrained models
+        self.normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
 
         self.bw_images = sorted(self.processed_dir.glob("*_bw.jpg"))
         print(f"Found {len(self.bw_images)} images in {processed_dir}")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.bw_images)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> tuple:
         bw_path = self.bw_images[idx]
         color_path = self.processed_dir / f"{bw_path.stem.replace('_bw', '')}_color.jpg"
 
         bw_img = Image.open(bw_path).convert('L')
         color_img = Image.open(color_path).convert('RGB')
 
-        return self.transform(bw_img), self.color_transform(color_img)
+        # Convert to tensors
+        bw_tensor = self.core_transform(bw_img)
+        color_tensor = self.core_transform(color_img)
+
+        # Convert BW to 3 channel and normalize
+        bw_tensor = bw_tensor.repeat(3, 1, 1)
+        bw_tensor = self.normalize(bw_tensor)
+
+        # Normalize color image
+        color_tensor = self.normalize(color_tensor)
+
+        return bw_tensor, color_tensor
 
 
-# Your original validate_model unchanged
-def validate_model(generator, val_loader, device, logger, epoch, step, num_samples=4):
-    """Run validation and log results"""
+def validate_model(
+        generator: nn.Module,
+        val_loader: DataLoader,
+        device: torch.device,
+        logger: TrainingLogger,
+        epoch: int,
+        step: int,
+        num_samples: int = 4
+) -> dict:
+    """Run validation with proper color space handling"""
     if isinstance(generator, DDP):
         generator = generator.module
 
@@ -65,7 +83,7 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
     }
     num_batches = 0
 
-    l1_loss = nn.L1Loss()
+    color_aware_loss = ColorAwareLoss().to(device)
     perceptual_loss = PerceptualLoss().to(device)
     color_hist_loss = ColorHistogramLoss().to(device)
 
@@ -74,20 +92,27 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
     val_bw, val_color = val_batch[0][:num_samples].to(device), val_batch[1][:num_samples].to(device)
 
     with torch.no_grad():
-        # Log sample images
-        val_generated = generator(val_bw)
-        logger.log_images(step, epoch, val_bw, val_generated, val_color)
+        # Generate and log sample images
+        generated_uv = generator(val_bw)
+        y_channel = val_bw[:, 0:1]
+        generated_yuv = torch.cat([y_channel, generated_uv], dim=1)
+        generated_rgb = yuv_to_rgb(generated_yuv)
+
+        logger.log_images(step, epoch, val_bw, generated_rgb, val_color)
 
         # Calculate metrics over full validation set
         for bw_imgs, color_imgs in val_loader:
             bw_imgs = bw_imgs.to(device)
             color_imgs = color_imgs.to(device)
 
-            generated_imgs = generator(bw_imgs)
+            generated_uv = generator(bw_imgs)
+            y_channel = bw_imgs[:, 0:1]
+            generated_yuv = torch.cat([y_channel, generated_uv], dim=1)
+            generated_rgb = yuv_to_rgb(generated_yuv)
 
-            l1 = l1_loss(generated_imgs, color_imgs)
-            perc = perceptual_loss(generated_imgs, color_imgs)
-            color = color_hist_loss(generated_imgs, color_imgs)
+            l1 = color_aware_loss(generated_uv, color_imgs)
+            perc, _ = perceptual_loss(generated_rgb, color_imgs)
+            color = color_hist_loss(generated_rgb, color_imgs)
             total = l1 + 0.1 * perc + 0.05 * color
 
             val_metrics['l1_loss'] += l1.item()
@@ -105,46 +130,47 @@ def validate_model(generator, val_loader, device, logger, epoch, step, num_sampl
     return val_metrics
 
 
-def setup_ddp(rank, world_size):
-    """Simple DDP setup"""
+def setup_ddp(rank: int, world_size: int):
+    """Initialize distributed training"""
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    # Removed the timeout argument here
     init_process_group("nccl", rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 
 def train_model_ddp(
-        rank,
-        world_size,
-        train_dir="processed_images/synthetic_pairs",
-        val_dir="processed_images/real_pairs",
-        batch_size=16,
-        num_epochs=100,
-        lr=0.0002,
-        image_size=512,
+        rank: int,
+        world_size: int,
+        train_dir: str = "processed_images/synthetic_pairs",
+        val_dir: str = "processed_images/real_pairs",
+        batch_size: int = 1,  # Starting with batch_size 1 as discussed
+        num_epochs: int = 100,
+        lr: float = 0.0002,
+        image_size: int = 512,
 ):
+    """Distributed training implementation with color-space aware processing"""
     setup_ddp(rank, world_size)
 
-    # Only create logger on main process
+    # Initialize logger on main process only
     logger = TrainingLogger(hyperparameters={
         'loss_weights': {
-            'l1': 0.5,
-            'perceptual': 0.3,
-            'color_histogram': 0.2
+            'l1': 1.0,
+            'perceptual': 0.1,
+            'color_histogram': 0.05,
+            'style': 0.01
         },
         'learning_rate': lr,
         'batch_size': batch_size * world_size,
         'image_size': image_size,
-        'optimizer': 'Adam',
-        'scheduler': 'ReduceLROnPlateau',
-        'architecture': 'UNet with semantic encoder and attention',
+        'optimizer': 'AdamW',
+        'scheduler': 'CosineAnnealingWarmRestarts',
+        'architecture': 'PhotochromGenerator with attention',
         'distributed_training': True,
         'num_gpus': world_size
     }) if rank == 0 else None
 
-    # Create datasets with distributed sampler for training
-    train_dataset = PhotochromDataset(train_dir, image_size=image_size)
+    # Create datasets with distributed sampler
+    train_dataset = PhotochromDataset(train_dir, image_size=image_size, augment=True)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     train_loader = DataLoader(
         train_dataset,
@@ -157,20 +183,38 @@ def train_model_ddp(
     # Validation loader only on main process
     val_loader = None
     if rank == 0:
-        val_dataset = PhotochromDataset(val_dir, image_size=image_size)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=1)
+        val_dataset = PhotochromDataset(val_dir, image_size=image_size, augment=False)
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=1
+        )
 
     # Initialize models and move to GPU
-    generator = Generator(debug=False).to(rank)
+    generator = PhotochromGenerator(pretrained=True, debug=(rank == 0)).to(rank)
     generator = DDP(generator, device_ids=[rank], find_unused_parameters=True)
 
-    perceptual_loss = PerceptualLoss().to(rank)
+    # Initialize losses
+    color_aware_loss = ColorAwareLoss().to(rank)
+    perceptual_loss = PerceptualLoss(style_weight=0.01).to(rank)
     color_hist_loss = ColorHistogramLoss().to(rank)
-    l1_loss = nn.L1Loss()
 
-    optimizer = torch.optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-    scaler = GradScaler()
+    # Initialize optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        generator.parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        weight_decay=0.01
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=10,
+        T_mult=2
+    )
+
+    scaler = GradScaler('cuda')
 
     # Set up checkpointing (only on rank 0)
     start_epoch = 0
@@ -205,12 +249,26 @@ def train_model_ddp(
                 color_imgs = color_imgs.to(rank)
 
                 with autocast(device_type='cuda'):
-                    generated_imgs = generator(bw_imgs)
-                    l1 = l1_loss(generated_imgs, color_imgs)
-                    perc = perceptual_loss(generated_imgs, color_imgs)
+                    # Generate UV channels
+                    generated_uv = generator(bw_imgs)
 
-                color = color_hist_loss(generated_imgs.float(), color_imgs.float())
-                total_loss = 0.5 * l1 + 0.3 * perc + 0.2 * color
+                    # Combine with Y channel and convert to RGB for loss calculation
+                    y_channel = bw_imgs[:, 0:1]
+                    generated_yuv = torch.cat([y_channel, generated_uv], dim=1)
+                    generated_rgb = yuv_to_rgb(generated_yuv)
+
+                    # Calculate losses
+                    l1 = color_aware_loss(generated_uv, color_imgs)
+                    perc, style_loss = perceptual_loss(generated_rgb, color_imgs)
+                    color = color_hist_loss(generated_rgb, color_imgs)
+
+                    # Combine losses
+                    total_loss = (
+                            l1 +
+                            0.1 * perc +
+                            0.05 * color +
+                            (0.01 * style_loss if style_loss is not None else 0)
+                    )
 
                 optimizer.zero_grad()
                 scaler.scale(total_loss).backward()
@@ -230,7 +288,8 @@ def train_model_ddp(
                             'l1_loss': l1.item(),
                             'perceptual_loss': perc.item(),
                             'color_hist_loss': color.item(),
-                            'total_loss': total_loss.item()
+                            'total_loss': total_loss.item(),
+                            'learning_rate': optimizer.param_groups[0]['lr']
                         }
                     }
                     logger.log_metrics(i + epoch * len(train_loader), epoch, metrics)
@@ -238,22 +297,37 @@ def train_model_ddp(
             # Only perform validation, logging, and checkpointing on main process
             if rank == 0:
                 avg_loss = total_loss_epoch / num_batches
-                val_metrics = validate_model(generator, val_loader, rank, logger, epoch,
-                                             i + epoch * len(train_loader))
+                val_metrics = validate_model(
+                    generator,
+                    val_loader,
+                    rank,
+                    logger,
+                    epoch,
+                    i + epoch * len(train_loader)
+                )
+
                 scheduler.step(avg_loss)
+
+                # Log end of epoch metrics
+                metrics = {
+                    'train': {'epoch_loss': avg_loss},
+                    'val': val_metrics,
+                    'learning_rate': optimizer.param_groups[0]['lr']
+                }
+                logger.log_metrics(i + epoch * len(train_loader), epoch, metrics)
 
                 # Save checkpoint
                 checkpoint_path = checkpoint_dir / f"checkpoint_epoch_{epoch}.pth"
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': generator.module.state_dict(),  # Save the inner model's state
+                    'model_state_dict': generator.module.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'scheduler_state_dict': scheduler.state_dict(),
                     'loss': avg_loss,
                     'val_metrics': val_metrics,
                 }, checkpoint_path)
 
-                # Clean up old checkpoints (keep only the latest two)
+                # Clean up old checkpoints
                 old_checkpoints = sorted(checkpoint_dir.glob("checkpoint_epoch_*.pth"))[:-2]
                 for ckpt in old_checkpoints:
                     ckpt.unlink()
@@ -284,4 +358,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
