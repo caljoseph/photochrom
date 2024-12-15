@@ -342,3 +342,57 @@ class ColorHistogramLoss(nn.Module):
         input_hist = self.get_histogram(input)
         target_hist = self.get_histogram(target)
         return F.l1_loss(input_hist, target_hist)
+
+
+def rgb_to_yuv(rgb: torch.Tensor) -> torch.Tensor:
+    """Convert RGB to YUV"""
+    # Matrix for RGB to YUV conversion
+    transform = torch.tensor([
+        [0.299, 0.587, 0.114],  # Y
+        [-0.147, -0.289, 0.436],  # U
+        [0.615, -0.515, -0.100]  # V
+    ], device=rgb.device)
+
+    # Reshape for matrix multiplication
+    rgb_reshaped = rgb.permute(0, 2, 3, 1)  # [B, H, W, C]
+    yuv_reshaped = torch.matmul(rgb_reshaped, transform.t())
+    yuv = yuv_reshaped.permute(0, 3, 1, 2)  # [B, C, H, W]
+
+    return yuv
+
+
+def yuv_to_rgb(yuv: torch.Tensor) -> torch.Tensor:
+    """Convert YUV to RGB"""
+    # Matrix for YUV to RGB conversion
+    transform = torch.tensor([
+        [1.0, 0.0, 1.14],
+        [1.0, -0.395, -0.581],
+        [1.0, 2.032, 0.0]
+    ], device=yuv.device)
+
+    # Reshape for matrix multiplication
+    yuv_reshaped = yuv.permute(0, 2, 3, 1)  # [B, H, W, C]
+    rgb_reshaped = torch.matmul(yuv_reshaped, transform.t())
+    rgb = rgb_reshaped.permute(0, 3, 1, 2)  # [B, C, H, W]
+
+    return rgb
+
+
+class ColorAwareLoss(nn.Module):
+    """Loss function that handles color space conversion"""
+
+    def __init__(self):
+        super().__init__()
+        self.l1_loss = nn.L1Loss()
+
+    def forward(self, generated_yuv: torch.Tensor, target_rgb: torch.Tensor) -> torch.Tensor:
+        # Extract Y channel from input image (assuming input is grayscale repeated 3 times)
+        y_channel = target_rgb[:, 0:1]  # Take first channel since R=G=B for grayscale
+
+        # Combine Y with generated UV
+        generated_full_yuv = torch.cat([y_channel, generated_yuv], dim=1)
+
+        # Convert both to RGB for comparison
+        generated_rgb = yuv_to_rgb(generated_full_yuv)
+
+        return self.l1_loss(generated_rgb, target_rgb)

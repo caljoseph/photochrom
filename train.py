@@ -6,7 +6,7 @@ from pathlib import Path
 from PIL import Image
 from torch.cuda.amp import autocast, GradScaler
 import numpy as np
-from models import PhotochromGenerator, PerceptualLoss, ColorHistogramLoss
+from models import PhotochromGenerator, PerceptualLoss, ColorHistogramLoss, ColorAwareLoss, yuv_to_rgb
 from logger import TrainingLogger
 from analysis_utils import PhotochromAnalyzer, PhotochromStyleAnalyzer, analyze_training_batch
 import os
@@ -167,23 +167,20 @@ def validate_model(
 
 
 def train_model(
-        train_dir: str = "processed_images/real_pairs",
-        val_dir: str = "processed_images/synthetic_pairs",
+        train_dir: str = "processed_images/synthetic_pairs",
+        val_dir: str = "processed_images/real_pairs",
         batch_size: int = 1,
         num_epochs: int = 100,
         lr: float = 0.0002,
         image_size: int = 512,
-        device: torch.device = torch.device(
-            "mps" if torch.backends.mps.is_available()
-            else "cuda" if torch.cuda.is_available()
-            else "cpu"
-        )) -> None:
-    """Main training loop for photochrom model with integrated analysis"""
+        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+) -> None:
+    """Main training loop for photochrom model"""
     logger.info(f"Using device: {device}")
     logger.info(f"Starting training with batch size: {batch_size}")
 
     # Create GradScaler for mixed precision training
-    scaler = GradScaler() if device.type == "cuda" else None
+    scaler = torch.amp.GradScaler('cuda') if device.type == "cuda" else None
 
     # Define hyperparameters
     hyperparameters = {
@@ -210,7 +207,7 @@ def train_model(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4 if device.type != "mps" else 0,
+        num_workers=1,  # Reduced worker count based on warnings
         pin_memory=True
     )
 
@@ -219,7 +216,7 @@ def train_model(
         val_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=2 if device.type != "mps" else 0,
+        num_workers=1,  # Reduced worker count based on warnings
         pin_memory=True
     )
 
@@ -227,7 +224,7 @@ def train_model(
     generator = PhotochromGenerator(pretrained=True, debug=True).to(device)
     perceptual_loss = PerceptualLoss(style_weight=0.01).to(device)
     color_hist_loss = ColorHistogramLoss().to(device)
-    l1_loss = nn.L1Loss()
+    color_aware_loss = ColorAwareLoss().to(device)
 
     # Load previous checkpoint if it exists
     checkpoint_dir = Path("checkpoints")
@@ -277,11 +274,19 @@ def train_model(
 
                 # Forward pass with mixed precision where available
                 if device.type == "cuda":
-                    with autocast():
-                        generated_imgs = generator(bw_imgs)
-                        l1 = l1_loss(generated_imgs, color_imgs)
-                        perc, style_loss = perceptual_loss(generated_imgs, color_imgs)
-                        color = color_hist_loss(generated_imgs, color_imgs)
+                    with torch.amp.autocast('cuda'):
+                        generated_uv = generator(bw_imgs)
+                        # Combine generated UV with Y channel from input
+                        y_channel = bw_imgs[:, 0:1]  # Take first channel since R=G=B for grayscale
+                        generated_yuv = torch.cat([y_channel, generated_uv], dim=1)
+
+                        # Convert to RGB for loss calculations
+                        generated_rgb = yuv_to_rgb(generated_yuv)
+
+                        # Calculate losses
+                        l1 = color_aware_loss(generated_uv, color_imgs)
+                        perc, style_loss = perceptual_loss(generated_rgb, color_imgs)
+                        color = color_hist_loss(generated_rgb, color_imgs)
 
                         # Combine losses
                         total_loss = (
@@ -291,11 +296,14 @@ def train_model(
                                 (0.01 * style_loss if style_loss is not None else 0)
                         )
                 else:
-                    # Regular forward pass for CPU/MPS
-                    generated_imgs = generator(bw_imgs)
-                    l1 = l1_loss(generated_imgs, color_imgs)
-                    perc, style_loss = perceptual_loss(generated_imgs, color_imgs)
-                    color = color_hist_loss(generated_imgs, color_imgs)
+                    generated_uv = generator(bw_imgs)
+                    y_channel = bw_imgs[:, 0:1]
+                    generated_yuv = torch.cat([y_channel, generated_uv], dim=1)
+                    generated_rgb = yuv_to_rgb(generated_yuv)
+
+                    l1 = color_aware_loss(generated_uv, color_imgs)
+                    perc, style_loss = perceptual_loss(generated_rgb, color_imgs)
+                    color = color_hist_loss(generated_rgb, color_imgs)
 
                     total_loss = (
                             l1 +
@@ -304,7 +312,7 @@ def train_model(
                             (0.01 * style_loss if style_loss is not None else 0)
                     )
 
-                # Backward pass with gradient scaling if using CUDA
+                # Backward pass
                 optimizer.zero_grad()
                 if scaler is not None:
                     scaler.scale(total_loss).backward()
@@ -351,12 +359,11 @@ def train_model(
             scheduler.step(avg_loss)
 
             # Run periodic analysis
-            if epoch % 10 == 0:  # Every 10 epochs
+            if epoch % 10 == 0:
                 logger.info("Running comprehensive analysis...")
                 analysis_dir = train_logger.analysis_dir / f"epoch_{epoch}_comprehensive"
                 analysis_dir.mkdir(exist_ok=True)
 
-                # Analyze a subset of validation samples
                 val_batch = next(iter(val_loader))
                 analysis_metrics = analyze_training_batch(
                     generator,
@@ -366,7 +373,6 @@ def train_model(
                     step=epoch
                 )
 
-                # Log analysis metrics
                 val_metrics.update({f'analysis_{k}': v for k, v in analysis_metrics.items()})
 
             # Log end of epoch metrics
