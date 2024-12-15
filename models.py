@@ -16,7 +16,7 @@ class EfficientAttentionBlock(nn.Module):
     def __init__(
             self,
             in_channels: int,
-            reduction_factor: int = 32,
+            reduction_factor: int = 8,
             window_size: int = 8,
             stride: int = None
     ):

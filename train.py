@@ -84,13 +84,13 @@ class PhotochromDataset(Dataset):
 
 
 def validate_model(
-    generator: nn.Module,
-    val_loader: DataLoader,
-    device: torch.device,
-    logger: TrainingLogger,
-    epoch: int,
-    step: int,
-    num_samples: int = 4
+        generator: nn.Module,
+        val_loader: DataLoader,
+        device: torch.device,
+        logger: TrainingLogger,
+        epoch: int,
+        step: int,
+        num_samples: int = 4
 ) -> Dict[str, float]:
     """Run validation with integrated analysis"""
     generator.eval()
@@ -111,17 +111,29 @@ def validate_model(
     all_val_samples = []
     with torch.no_grad():
         for batch in val_loader:
-            all_val_samples.append((batch[0].to(device), batch[1].to(device)))
+            bw, color = batch[0].to(device), batch[1].to(device)
+            all_val_samples.append((bw, color))
 
-    # Randomly select samples for visualization
-    if len(all_val_samples) > num_samples:
-        vis_samples = random.sample(all_val_samples, num_samples)
+    # Create lists for visualization samples
+    vis_bw = []
+    vis_color = []
+
+    # Get num_samples random indices
+    total_samples = len(all_val_samples)
+    if total_samples >= num_samples:
+        indices = random.sample(range(total_samples), num_samples)
     else:
-        vis_samples = all_val_samples
+        indices = list(range(total_samples)) * (num_samples // total_samples + 1)
+        indices = indices[:num_samples]
 
-    # Concatenate selected samples
-    val_bw = torch.cat([sample[0] for sample in vis_samples])
-    val_color = torch.cat([sample[1] for sample in vis_samples])
+    # Collect the samples
+    for idx in indices:
+        vis_bw.append(all_val_samples[idx][0])
+        vis_color.append(all_val_samples[idx][1])
+
+    # Concatenate samples
+    val_bw = torch.cat(vis_bw, dim=0)
+    val_color = torch.cat(vis_color, dim=0)
 
     with torch.no_grad():
         # Generate and log sample images
