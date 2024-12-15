@@ -142,7 +142,7 @@ class PhotochromGenerator(nn.Module):
     def __init__(
             self,
             pretrained: bool = True,
-            backbone: str = 'resnet101',
+            backbone: str = 'resnet50',
             debug: bool = False,
             tracker: Optional[MemoryTracker] = None
     ):
