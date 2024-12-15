@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
+from torch.utils.checkpoint import checkpoint
 from typing import List, Tuple, Optional
 import logging
 
@@ -9,6 +10,8 @@ from debug_utils import MemoryTracker
 
 logger = logging.getLogger(__name__)
 
+
+from torch.utils.checkpoint import checkpoint
 
 class AttentionBlock(nn.Module):
     """Self-attention block with memory tracking"""
@@ -18,8 +21,8 @@ class AttentionBlock(nn.Module):
         self.in_channels = in_channels
         self.tracker = tracker
 
-        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.query = nn.Conv2d(in_channels, in_channels // 32, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels // 32, kernel_size=1)
         self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.gamma = nn.Parameter(torch.zeros(1))
 
@@ -33,36 +36,41 @@ class AttentionBlock(nn.Module):
             self.tracker.log_tensor("attention_input", x)
             self.tracker.log_memory("attention_start")
 
-        batch_size, C, H, W = x.size()
+        # Wrap attention computation with checkpointing
+        def attention_fn(input_x):
+            batch_size, C, H, W = input_x.size()
 
-        # Compute query, key, value transformations
-        query = self.query(x).view(batch_size, -1, H * W)
-        key = self.key(x).view(batch_size, -1, H * W)
-        value = self.value(x).view(batch_size, -1, H * W)
+            # Compute query, key, value transformations
+            query = self.query(input_x).view(batch_size, -1, H * W)
+            key = self.key(input_x).view(batch_size, -1, H * W)
+            value = self.value(input_x).view(batch_size, -1, H * W)
+
+            if self.tracker:
+                self.tracker.log_tensor("attention_query", query)
+                self.tracker.log_tensor("attention_key", key)
+                self.tracker.log_tensor("attention_value", value)
+                self.tracker.log_memory("after_qkv_transform")
+
+            # Compute attention scores
+            attention = torch.bmm(query.permute(0, 2, 1), key)
+
+            if self.tracker:
+                self.tracker.log_tensor("attention_scores", attention)
+                self.tracker.log_memory("after_attention_computation")
+
+            attention = F.softmax(attention, dim=-1)
+
+            out = torch.bmm(value, attention.permute(0, 2, 1))
+            out = out.view(batch_size, C, H, W)
+            return self.gamma * out + input_x
+
+        x = checkpoint(attention_fn, x)
 
         if self.tracker:
-            self.tracker.log_tensor("attention_query", query)
-            self.tracker.log_tensor("attention_key", key)
-            self.tracker.log_tensor("attention_value", value)
-            self.tracker.log_memory("after_qkv_transform")
-
-        # Compute attention scores
-        attention = torch.bmm(query.permute(0, 2, 1), key)
-
-        if self.tracker:
-            self.tracker.log_tensor("attention_scores", attention)
-            self.tracker.log_memory("after_attention_computation")
-
-        attention = F.softmax(attention, dim=-1)
-
-        out = torch.bmm(value, attention.permute(0, 2, 1))
-        out = out.view(batch_size, C, H, W)
-
-        if self.tracker:
-            self.tracker.log_tensor("attention_output", out)
+            self.tracker.log_tensor("attention_output", x)
             self.tracker.log_memory("attention_end")
 
-        return self.gamma * out + x
+        return x
 
 class UpsampleBlock(nn.Module):
     """Upsampling block with optional residual connection"""
@@ -140,11 +148,11 @@ class PhotochromGenerator(nn.Module):
     """Generator model for photochrom-style colorization"""
 
     def __init__(
-            self,
-            pretrained: bool = True,
-            backbone: str = 'resnet50',
-            debug: bool = False,
-            tracker: Optional[MemoryTracker] = None
+        self,
+        pretrained: bool = True,
+        backbone: str = 'resnet50',
+        debug: bool = False,
+        tracker: Optional[MemoryTracker] = None
     ):
         super().__init__()
         self.debug = debug
@@ -200,7 +208,7 @@ class PhotochromGenerator(nn.Module):
         # Add final upsampling
         self.final_upsample = UpsampleBlock(dec_channels[3], dec_channels[3], scale_factor=2)
 
-        # Add attention blocks - pass tracker to each
+        # Add attention blocks
         self.attention_blocks = nn.ModuleList([
             AttentionBlock(dec_channels[0], tracker=tracker),
             AttentionBlock(dec_channels[1], tracker=tracker),
@@ -238,7 +246,7 @@ class PhotochromGenerator(nn.Module):
             self.tracker.log_memory("generator_forward_start")
             self.tracker.log_tensor("generator_input", x)
 
-        self.debug_shape("Input", x)  # Use instance method
+        self.debug_shape("Input", x)
 
         # Store encoder outputs for skip connections
         encoder_features = []
@@ -248,7 +256,7 @@ class PhotochromGenerator(nn.Module):
             x = stage(x)
             if self.tracker:
                 self.tracker.log_tensor(f"encoder_stage_{i}_output", x)
-            self.debug_shape(f"Encoder stage {i}", x)  # Use instance method
+            self.debug_shape(f"Encoder stage {i}", x)
             encoder_features.append(x)
 
         if self.tracker:
@@ -262,15 +270,13 @@ class PhotochromGenerator(nn.Module):
                     self.tracker.log_tensor(f"skip_connection_{i}", x)
                 self.debug_shape(f"Skip connection {i}", x)
 
-            x = dec_stage(x)
-            if self.tracker:
-                self.tracker.log_tensor(f"decoder_stage_{i}_output", x)
-            self.debug_shape(f"Decoder stage {i}", x)
+            # Apply gradient checkpointing for decoder + attention
+            def forward_with_attention(input_x):
+                out = dec_stage(input_x)
+                out = attn(out)
+                return out
 
-            x = attn(x)
-            if self.tracker:
-                self.tracker.log_tensor(f"attention_{i}_output", x)
-            self.debug_shape(f"Attention {i}", x)
+            x = checkpoint(forward_with_attention, x)
 
         # Final upsampling and output
         x = self.final_upsample(x)

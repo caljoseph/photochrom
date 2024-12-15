@@ -173,7 +173,7 @@ def train_model(
         num_epochs: int = 100,
         lr: float = 0.0002,
         image_size: int = 512,
-        device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device: torch.device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu")
 ) -> None:
     """Main training loop for photochrom model"""
     logger.info(f"Using device: {device}")
