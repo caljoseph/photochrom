@@ -143,10 +143,15 @@ class PhotochromGenerator(nn.Module):
             self,
             pretrained: bool = True,
             backbone: str = 'resnet101',
-            debug: bool = False
+            debug: bool = False,
+            tracker: Optional[MemoryTracker] = None
     ):
         super().__init__()
         self.debug = debug
+        self.tracker = tracker
+
+        if self.tracker:
+            self.tracker.log_memory("generator_init_start")
 
         # Get specified backbone model
         if backbone == 'resnet101':
@@ -170,11 +175,14 @@ class PhotochromGenerator(nn.Module):
             base_model.layer4
         ])
 
+        if self.tracker:
+            self.tracker.log_memory("after_encoder_init")
+
         # Get channel dimensions for each stage
         enc_channels = [256, 512, 1024, 2048]
         dec_channels = [256, 128, 64, 32]
 
-        # Create decoder stages with proper upsampling
+        # Create decoder stages
         self.decoder_stages = nn.ModuleList([
             UpsampleBlock(enc_channels[3], dec_channels[0], scale_factor=2),
             UpsampleBlock(dec_channels[0] + enc_channels[2], dec_channels[1], scale_factor=2),
@@ -182,16 +190,19 @@ class PhotochromGenerator(nn.Module):
             UpsampleBlock(dec_channels[2] + enc_channels[0], dec_channels[3], scale_factor=2)
         ])
 
-        # Add final upsampling to match input resolution
+        # Add final upsampling
         self.final_upsample = UpsampleBlock(dec_channels[3], dec_channels[3], scale_factor=2)
 
-        # Add attention blocks after each decoder stage
+        # Add attention blocks - pass tracker to each
         self.attention_blocks = nn.ModuleList([
-            AttentionBlock(dec_channels[0]),
-            AttentionBlock(dec_channels[1]),
-            AttentionBlock(dec_channels[2]),
-            AttentionBlock(dec_channels[3])
+            AttentionBlock(dec_channels[0], tracker=tracker),
+            AttentionBlock(dec_channels[1], tracker=tracker),
+            AttentionBlock(dec_channels[2], tracker=tracker),
+            AttentionBlock(dec_channels[3], tracker=tracker)
         ])
+
+        if self.tracker:
+            self.tracker.log_memory("after_decoder_init")
 
         # Final output layers
         self.final = nn.Sequential(
@@ -211,8 +222,15 @@ class PhotochromGenerator(nn.Module):
         if debug:
             logger.setLevel(logging.DEBUG)
 
+        if self.tracker:
+            self.tracker.log_memory("generator_init_complete")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of generator"""
+        """Forward pass of generator with memory tracking"""
+        if self.tracker:
+            self.tracker.log_memory("generator_forward_start")
+            self.tracker.log_tensor("generator_input", x)
+
         self._debug_shape("Input", x)
 
         # Store encoder outputs for skip connections
@@ -221,34 +239,42 @@ class PhotochromGenerator(nn.Module):
         # Encoder forward pass
         for i, stage in enumerate(self.encoder_stages):
             x = stage(x)
+            if self.tracker:
+                self.tracker.log_tensor(f"encoder_stage_{i}_output", x)
             self._debug_shape(f"Encoder stage {i}", x)
             encoder_features.append(x)
+
+        if self.tracker:
+            self.tracker.log_memory("encoder_complete")
 
         # Decoder forward pass with skip connections
         for i, (dec_stage, attn) in enumerate(zip(self.decoder_stages, self.attention_blocks)):
             if i > 0:  # Skip connection after first decoder block
                 x = torch.cat([x, encoder_features[-(i + 1)]], dim=1)
+                if self.tracker:
+                    self.tracker.log_tensor(f"skip_connection_{i}", x)
                 self._debug_shape(f"Skip connection {i}", x)
 
             x = dec_stage(x)
+            if self.tracker:
+                self.tracker.log_tensor(f"decoder_stage_{i}_output", x)
             self._debug_shape(f"Decoder stage {i}", x)
 
             x = attn(x)
+            if self.tracker:
+                self.tracker.log_tensor(f"attention_{i}_output", x)
             self._debug_shape(f"Attention {i}", x)
 
-        # Final upsampling to match input resolution
+        # Final upsampling and output
         x = self.final_upsample(x)
-
-        # Final output
         x = self.final(x)
+
+        if self.tracker:
+            self.tracker.log_tensor("generator_output", x)
+            self.tracker.log_memory("generator_forward_complete")
+
         self._debug_shape("Output", x)
-
         return x
-
-    def _debug_shape(self, name: str, tensor: torch.Tensor):
-        """Helper to log tensor shapes during forward pass"""
-        if self.debug:
-            logger.debug(f"{name} shape: {tensor.shape}")
 
 def init_weights(model: nn.Module):
     """Initialize network weights using kaiming normal"""
