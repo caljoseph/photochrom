@@ -260,17 +260,17 @@ class PhotochromGenerator(nn.Module):
                 x = torch.cat([x, encoder_features[-(i + 1)]], dim=1)
                 if self.tracker:
                     self.tracker.log_tensor(f"skip_connection_{i}", x)
-                self._debug_shape(f"Skip connection {i}", x)
+                self.debug_shape(f"Skip connection {i}", x)
 
             x = dec_stage(x)
             if self.tracker:
                 self.tracker.log_tensor(f"decoder_stage_{i}_output", x)
-            self._debug_shape(f"Decoder stage {i}", x)
+            self.debug_shape(f"Decoder stage {i}", x)
 
             x = attn(x)
             if self.tracker:
                 self.tracker.log_tensor(f"attention_{i}_output", x)
-            self._debug_shape(f"Attention {i}", x)
+            self.debug_shape(f"Attention {i}", x)
 
         # Final upsampling and output
         x = self.final_upsample(x)
@@ -280,7 +280,7 @@ class PhotochromGenerator(nn.Module):
             self.tracker.log_tensor("generator_output", x)
             self.tracker.log_memory("generator_forward_complete")
 
-        self._debug_shape("Output", x)
+        self.debug_shape("Output", x)
         return x
 
 def init_weights(model: nn.Module):
