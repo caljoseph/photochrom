@@ -1,414 +1,345 @@
 import torch
 import torch.nn as nn
-import torchvision.models as models
 import torch.nn.functional as F
-import numpy as np
+import torchvision.models as models
+from typing import List, Tuple, Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-def debug_tensor(tensor, name, detailed=False):
-    """Enhanced debug function with distribution analysis and gradient handling"""
-    with torch.no_grad():  # Prevent gradient computation during debugging
-        # Detach tensor for stats computation
-        t = tensor.detach()
+class AttentionBlock(nn.Module):
+    """Efficient self-attention block optimized for GPU training"""
 
-        stats = {
-            "shape": t.shape,
-            "range": [t.min().item(), t.max().item()],
-            "mean": t.mean().item(),
-            "std": t.std().item()
-        }
-
-        if detailed:
-            # Analyze distribution
-            percentiles = torch.tensor([0, 25, 50, 75, 100], device=t.device)
-            stats["percentiles"] = torch.quantile(t.flatten(), percentiles / 100).cpu().numpy()
-
-            # Channel-wise stats for feature maps
-            if len(t.shape) == 4:
-                step = max(1, t.shape[1] // 4)  # Ensure step is at least 1
-                stats["channel_means"] = t.mean(dim=(0, 2, 3))[::step].cpu().numpy()
-
-        print(f"\n=== {name} ===")
-        print(f"Shape: {stats['shape']}")
-        print(f"Range: [{stats['range'][0]:.3f}, {stats['range'][1]:.3f}]")
-        print(f"Mean: {stats['mean']:.3f}, Std: {stats['std']:.3f}")
-
-        if detailed:
-            print(f"Percentiles (0,25,50,75,100): {stats['percentiles']}")
-            if len(t.shape) == 4:
-                print(f"Sample channel means: {stats['channel_means']}")
-
-        return stats
-
-
-class ColorAwareAttention(nn.Module):
-    """
-    Custom attention mechanism designed specifically for photochrom colorization.
-    Uses separate structural and color pathways with hierarchical region understanding.
-    """
-
-    def __init__(self, channels, debug=False):
+    def __init__(self, in_channels: int):
         super().__init__()
-        self.debug = debug
-        self.channels = channels
-
-        # Structure pathway
-        self.structure_proj = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.GroupNorm(8, channels // 4),
-            nn.GELU(),
-            nn.Conv2d(channels // 4, channels // 4, 3, padding=1, groups=channels // 32),
-            nn.GroupNorm(8, channels // 4),
-            nn.GELU()
-        )
-
-        # Color pathway
-        self.color_proj = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.GroupNorm(8, channels // 4),
-            nn.GELU(),
-            nn.Conv2d(channels // 4, channels // 4, 3, padding=1, groups=channels // 32),
-            nn.GroupNorm(8, channels // 4),
-            nn.GELU()
-        )
-
-        # Multi-scale region understanding
-        self.region_scales = [1, 2, 4]
-        self.region_convs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(channels // 4, channels // 4, kernel_size=3,
-                          padding=1, stride=scale),
-                nn.GroupNorm(8, channels // 4),
-                nn.GELU()
-            ) for scale in self.region_scales
-        ])
-
-        # Value projection
-        self.value = nn.Sequential(
-            nn.Conv2d(channels, channels, 1),
-            nn.GroupNorm(16, channels),
-            nn.Conv2d(channels, channels, 3, padding=1, groups=channels // 16),
-            nn.GroupNorm(16, channels),
-            nn.GELU()
-        )
-
-        # Output projection
-        self.out_proj = nn.Sequential(
-            nn.Conv2d(len(self.region_scales) * channels, channels, 1),
-            nn.GroupNorm(16, channels),
-            nn.GELU(),
-            nn.Conv2d(channels, channels, 1)
-        )
-
-        self.scale = nn.Parameter(torch.ones(len(self.region_scales)))
+        self.in_channels = in_channels
+        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
         self.gamma = nn.Parameter(torch.zeros(1))
 
-    def _compute_region_attention(self, q, k, v, scale_idx):
-        B, C, H, W = q.shape
+        # Initialize weights
+        for m in [self.query, self.key, self.value]:
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
-        # Reshape all tensors to have compatible dimensions
-        q_flat = q.view(B, C, -1)  # B, C, HW
-        k_flat = k.view(B, C, -1)  # B, C, HW
-        v_flat = v.view(B, v.size(1), -1)  # B, C_v, HW
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, C, H, W = x.size()
+
+        # Compute query, key, value transformations
+        query = self.query(x).view(batch_size, -1, H * W)  # B x C' x N
+        key = self.key(x).view(batch_size, -1, H * W)  # B x C' x N
+        value = self.value(x).view(batch_size, -1, H * W)  # B x C x N
 
         # Compute attention scores
-        attn = torch.bmm(q_flat.permute(0, 2, 1), k_flat)  # B, HW, HW
-        attn = attn * self.scale[scale_idx] / np.sqrt(C)
-        attn = F.softmax(attn, dim=-1)
+        attention = torch.bmm(
+            query.permute(0, 2, 1),  # B x N x C'
+            key  # B x C' x N
+        )  # B x N x N
 
-        if self.debug:
-            debug_tensor(attn, f"Attention Scale {scale_idx}")
+        # Normalize attention scores
+        attention = F.softmax(attention, dim=-1)
 
-        # Apply attention
-        out = torch.bmm(v_flat, attn.permute(0, 2, 1))  # B, C_v, HW
-        return out.view(B, v.size(1), H, W)
+        # Apply attention to value
+        out = torch.bmm(
+            value,  # B x C x N
+            attention.permute(0, 2, 1)  # B x N x N
+        )  # B x C x N
 
-    def forward(self, x):
-        B, C, H, W = x.shape
+        # Reshape back to spatial dimensions
+        out = out.view(batch_size, C, H, W)
 
-        if self.debug:
-            debug_tensor(x, "Attention Input")
-
-        # Extract structure and color features
-        struct_feats = self.structure_proj(x)
-        color_feats = self.color_proj(x)
-        value = self.value(x)
-
-        if self.debug:
-            debug_tensor(struct_feats, "Structure Features")
-            debug_tensor(color_feats, "Color Features")
-
-        # Multi-scale attention
-        outputs = []
-        for i, (scale, conv) in enumerate(zip(self.region_scales, self.region_convs)):
-            # Get regional features at current scale
-            q_struct = conv(struct_feats)
-            k_struct = conv(struct_feats)
-            q_color = conv(color_feats)
-
-            # Scale value features to match current resolution
-            current_h, current_w = H // scale, W // scale
-            v_scaled = F.interpolate(value, size=(current_h, current_w),
-                                     mode='bilinear', align_corners=False)
-
-            # Compute attention with dimension matching
-            struct_out = self._compute_region_attention(q_struct, k_struct, v_scaled, i)
-            color_out = self._compute_region_attention(q_color, k_struct, v_scaled, i)
-
-            # Return to original resolution
-            if scale > 1:
-                struct_out = F.interpolate(struct_out, size=(H, W),
-                                           mode='bilinear', align_corners=False)
-
-            outputs.append(struct_out)  # Only use structural attention output for simplicity
-
-        # Combine multi-scale outputs
-        combined = torch.cat(outputs, dim=1)
-        out = self.out_proj(combined)
-
-        return x + self.gamma * out
-
-class SemanticEncoder(nn.Module):
-    def __init__(self, debug=False):
-        super().__init__()
-        self.debug = debug
-
-        resnet = models.resnet50(pretrained=True)
-        self.encoder = nn.Sequential(
-            resnet.conv1,
-            resnet.bn1,
-            resnet.relu,
-            resnet.maxpool,
-            resnet.layer1,
-            resnet.layer2
-        )
-
-        self.projection = nn.Sequential(
-            nn.Conv2d(512, 512, 1),
-            nn.GroupNorm(16, 512),
-            nn.GELU(),
-            nn.Conv2d(512, 512, 3, padding=1, groups=16),
-            nn.GroupNorm(16, 512),
-            nn.GELU()
-        )
-
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-
-    def forward(self, x):
-        if x.size(1) == 1:
-            x = x.repeat(1, 3, 1, 1)
-
-        if self.debug:
-            debug_tensor(x, "Semantic Encoder Input")
-
-        features = self.encoder(x)
-        features = self.projection(features)
-
-        if self.debug:
-            debug_tensor(features, "Semantic Features", detailed=True)
-
-        return features
-
+        # Apply learnable scaling factor and residual connection
+        return self.gamma * out + x
 
 class UpsampleBlock(nn.Module):
-    def __init__(self, in_channels, skip_channels, out_channels, debug=False):
+    """Upsampling block with optional residual connection"""
+
+    def __init__(
+            self,
+            in_channels: int,
+            out_channels: int,
+            scale_factor: int = 2,
+            use_residual: bool = True
+    ):
+        super().__init__()
+        self.use_residual = use_residual
+
+        # Main convolution path
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * (scale_factor ** 2), 3, padding=1),
+            nn.BatchNorm2d(out_channels * (scale_factor ** 2)),
+            nn.ReLU(inplace=True)
+        )
+
+        # Pixel shuffle upsampling
+        self.shuffle = nn.PixelShuffle(scale_factor)
+
+        # Optional residual connection
+        if use_residual and in_channels == out_channels:
+            self.residual = nn.Upsample(
+                scale_factor=scale_factor,
+                mode='bilinear',
+                align_corners=False
+            )
+        else:
+            self.residual = None
+
+        # Gaussian blur to reduce checkerboard artifacts
+        kernel_size = scale_factor * 2 - 1
+        self.blur = nn.Conv2d(
+            out_channels, out_channels,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            padding_mode='reflect',
+            bias=False,
+            groups=out_channels
+        )
+
+        # Initialize blur kernel with Gaussian
+        with torch.no_grad():
+            kernel = torch.zeros(kernel_size, kernel_size)
+            center = kernel_size // 2
+            sigma = 0.3 * ((kernel_size - 1) * 0.5 - 1) + 0.8
+
+            for x in range(kernel_size):
+                for y in range(kernel_size):
+                    diff = torch.tensor([x - center, y - center])
+                    kernel[x, y] = torch.exp(-(diff @ diff) / (2 * sigma ** 2))
+
+            kernel = kernel / kernel.sum()
+
+            # Set kernel for all output channels
+            kernel = kernel.expand(out_channels, 1, kernel_size, kernel_size)
+            self.blur.weight.data = kernel
+            self.blur.weight.requires_grad = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.conv(x)
+        out = self.shuffle(out)
+
+        if self.residual is not None:
+            out = out + self.residual(x)
+
+        return self.blur(out)
+
+
+class PhotochromGenerator(nn.Module):
+    """Generator model for photochrom-style colorization"""
+
+    def __init__(
+            self,
+            pretrained: bool = True,
+            backbone: str = 'resnet101',
+            debug: bool = False
+    ):
         super().__init__()
         self.debug = debug
 
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1),
-            nn.GroupNorm(8, out_channels),
-            nn.GELU()
-        )
+        # Get specified backbone model
+        if backbone == 'resnet101':
+            base_model = models.resnet101(pretrained=pretrained)
+        elif backbone == 'resnet50':
+            base_model = models.resnet50(pretrained=pretrained)
+        else:
+            raise ValueError(f"Unsupported backbone: {backbone}")
 
-        self.residual = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=16),
-            nn.GroupNorm(8, out_channels),
-            nn.GELU(),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1, groups=16),
-            nn.GroupNorm(8, out_channels)
-        )
+        # Extract encoder layers
+        self.encoder_stages = nn.ModuleList([
+            nn.Sequential(
+                base_model.conv1,
+                base_model.bn1,
+                base_model.relu,
+                base_model.maxpool,
+                base_model.layer1
+            ),
+            base_model.layer2,
+            base_model.layer3,
+            base_model.layer4
+        ])
 
-        self.channel_gate = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(out_channels, out_channels // 4, 1),
-            nn.GELU(),
-            nn.Conv2d(out_channels // 4, out_channels, 1),
-            nn.Sigmoid()
-        )
+        # Get channel dimensions for each stage
+        enc_channels = [256, 512, 1024, 2048]
+        dec_channels = [256, 128, 64, 32]
 
-    def forward(self, x, skip):
-        if self.debug:
-            debug_tensor(x, "Upsample Input")
-            debug_tensor(skip, "Skip Connection")
+        # Create decoder stages
+        self.decoder_stages = nn.ModuleList([
+            UpsampleBlock(enc_channels[3], dec_channels[0]),
+            UpsampleBlock(dec_channels[0] + enc_channels[2], dec_channels[1]),
+            UpsampleBlock(dec_channels[1] + enc_channels[1], dec_channels[2]),
+            UpsampleBlock(dec_channels[2] + enc_channels[0], dec_channels[3])
+        ])
 
-        x = F.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
-        x = torch.cat([x, skip], dim=1)
-        x = self.conv1(x)
+        # Add attention blocks after each decoder stage
+        self.attention_blocks = nn.ModuleList([
+            AttentionBlock(dec_channels[0]),
+            AttentionBlock(dec_channels[1]),
+            AttentionBlock(dec_channels[2]),
+            AttentionBlock(dec_channels[3])
+        ])
 
-        residual = self.residual(x)
-        attention = self.channel_gate(residual)
-        out = x + residual * attention
-
-        if self.debug:
-            debug_tensor(out, "Upsample Output")
-
-        return out
-
-
-class Generator(nn.Module):
-    def __init__(self, debug=False):
-        super().__init__()
-        self.debug = debug
-        init_channels = 48  # Base channel count
-        final_encoder_channels = init_channels * 8  # This will be 384
-
-        self.semantic_encoder = SemanticEncoder(debug=debug)
-
-        # Project semantic features to match encoder dimensions
-        self.semantic_projection = nn.Sequential(
-            nn.Conv2d(512, final_encoder_channels, 1),
-            nn.GroupNorm(16, final_encoder_channels),
-            nn.GELU()
-        )
-
-        # Encoder
-        self.enc1 = nn.Sequential(
-            nn.Conv2d(1, init_channels, 7, padding=3),
-            nn.GroupNorm(8, init_channels),
-            nn.GELU()
-        )
-
-        self.enc2 = nn.Sequential(
-            nn.Conv2d(init_channels, init_channels * 2, 4, stride=2, padding=1),
-            nn.GroupNorm(8, init_channels * 2),
-            nn.GELU()
-        )
-
-        self.enc3 = nn.Sequential(
-            nn.Conv2d(init_channels * 2, init_channels * 4, 4, stride=2, padding=1),
-            nn.GroupNorm(8, init_channels * 4),
-            nn.GELU()
-        )
-
-        self.enc4 = nn.Sequential(
-            nn.Conv2d(init_channels * 4, final_encoder_channels, 4, stride=2, padding=1),
-            nn.GroupNorm(8, final_encoder_channels),
-            nn.GELU()
-        )
-
-        # Attention blocks
-        self.attention1 = ColorAwareAttention(init_channels * 8, debug=debug)
-        self.attention2 = ColorAwareAttention(init_channels * 4, debug=debug)
-
-        # Decoder
-        self.dec1 = UpsampleBlock(final_encoder_channels, init_channels * 4, init_channels * 4, debug=debug)
-        self.dec2 = UpsampleBlock(init_channels * 4, init_channels * 2, init_channels * 2, debug=debug)
-        self.dec3 = UpsampleBlock(init_channels * 2, init_channels, init_channels, debug=debug)
-
-        # Final output
+        # Final output layers
         self.final = nn.Sequential(
-            nn.Conv2d(init_channels, init_channels // 2, 3, padding=1),
-            nn.GroupNorm(8, init_channels // 2),
-            nn.GELU(),
-            nn.Conv2d(init_channels // 2, 3, 7, padding=3),
+            nn.Conv2d(dec_channels[3], 16, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 2, kernel_size=1),  # UV channels only
             nn.Tanh()
         )
 
-    def forward(self, x):
+        # Initialize final layers
+        for m in self.final:
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+        if debug:
+            logger.setLevel(logging.DEBUG)
+
+    def _debug_shape(self, name: str, tensor: torch.Tensor):
+        """Helper to log tensor shapes during forward pass"""
         if self.debug:
-            debug_tensor(x, "Generator Input", detailed=True)
+            logger.debug(f"{name} shape: {tensor.shape}")
 
-        # Extract and project semantic features
-        semantic_features = self.semantic_encoder(x)
-        semantic_features = self.semantic_projection(semantic_features)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass of generator
+        Args:
+            x: Input tensor of shape (B, C, H, W)
+        Returns:
+            UV color channels of shape (B, 2, H, W)
+        """
+        self._debug_shape("Input", x)
 
-        # Encoder path
-        e1 = self.enc1(x)
-        e2 = self.enc2(e1)
-        e3 = self.enc3(e2)
-        e4 = self.enc4(e3)
+        # Store encoder outputs for skip connections
+        encoder_features = []
 
-        if self.debug:
-            debug_tensor(e4, "Main Encoder Features", detailed=True)
-            debug_tensor(semantic_features, "Projected Semantic Features", detailed=True)
+        # Encoder forward pass
+        for i, stage in enumerate(self.encoder_stages):
+            x = stage(x)
+            self._debug_shape(f"Encoder stage {i}", x)
+            encoder_features.append(x)
 
-        # Feature fusion
-        e4 = e4 + semantic_features
+        # Decoder forward pass with skip connections
+        for i, (dec_stage, attn) in enumerate(zip(self.decoder_stages, self.attention_blocks)):
+            if i > 0:  # Skip connection after first decoder block
+                x = torch.cat([x, encoder_features[-(i + 1)]], dim=1)
+                self._debug_shape(f"Skip connection {i}", x)
 
-        if self.debug:
-            debug_tensor(e4, "Fused Features", detailed=True)
+            x = dec_stage(x)
+            self._debug_shape(f"Decoder stage {i}", x)
 
-        # Attention and decoder path
-        e4 = self.attention1(e4)
-        d1 = self.dec1(e4, e3)
-        d1 = self.attention2(d1)
-        d2 = self.dec2(d1, e2)
-        d3 = self.dec3(d2, e1)
+            x = attn(x)
+            self._debug_shape(f"Attention {i}", x)
 
-        out = self.final(d3)
+        # Final output
+        x = self.final(x)
+        self._debug_shape("Output", x)
 
-        if self.debug:
-            debug_tensor(out, "Final Output", detailed=True)
+        return x
 
-        return out
+
+def init_weights(model: nn.Module):
+    """Initialize network weights using kaiming normal"""
+    for m in model.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.kaiming_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+
 
 class PerceptualLoss(nn.Module):
-    def __init__(self):
+    """VGG-based perceptual loss for training"""
+
+    def __init__(self, style_weight: float = 0.0):
         super().__init__()
-        vgg = models.vgg16(pretrained=True).features[:23]
-        for param in vgg.parameters():
+        vgg = models.vgg16(pretrained=True).features
+        self.slices = nn.ModuleList([
+            nn.Sequential(*list(vgg.children())[:4]),  # relu1_2
+            nn.Sequential(*list(vgg.children())[4:9]),  # relu2_2
+            nn.Sequential(*list(vgg.children())[9:16]),  # relu3_3
+            nn.Sequential(*list(vgg.children())[16:23])  # relu4_3
+        ])
+
+        for param in self.parameters():
             param.requires_grad = False
-        self.vgg = vgg
+
+        self.style_weight = style_weight
         self.register_buffer('mean', torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
         self.register_buffer('std', torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
-    def normalize(self, x):
-        return (x * 0.5 + 0.5 - self.mean) / self.std
+    def gram_matrix(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.size()
+        features = x.view(b, c, h * w)
+        gram = torch.bmm(features, features.transpose(1, 2))
+        return gram.div(c * h * w)
 
-    def forward(self, generated, target):
-        generated = self.normalize(generated)
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean) / self.std
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input = self.normalize(input)
         target = self.normalize(target)
-        return F.mse_loss(self.vgg(generated), self.vgg(target))
+
+        content_loss = 0.0
+        style_loss = 0.0
+
+        for slice in self.slices:
+            input = slice(input)
+            target = slice(target)
+
+            content_loss += F.l1_loss(input, target)
+
+            if self.style_weight > 0:
+                style_loss += F.l1_loss(
+                    self.gram_matrix(input),
+                    self.gram_matrix(target)
+                )
+
+        if self.style_weight > 0:
+            return content_loss + self.style_weight * style_loss, style_loss
+
+        return content_loss, None
 
 
 class ColorHistogramLoss(nn.Module):
-    def __init__(self, bins=64):
+    """Color histogram matching loss"""
+
+    def __init__(self, bins: int = 64):
         super().__init__()
         self.bins = bins
-        self.eps = 1e-8
 
-    def get_histogram(self, x):
-        x = (x + 1) / 2
-        x = torch.clamp(x, 0, 1)
+    def get_histogram(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute histogram for batch of images"""
+        x = x.view(x.size(0), x.size(1), -1)
+        values = torch.linspace(-1, 1, self.bins, device=x.device)
+        hist = []
 
-        hist_list = []
-        for i in range(1, 3):  # a and b channels
-            hist = torch.histc(x[:, i].flatten(), bins=self.bins, min=0, max=1)
-            hist = hist + self.eps
-            hist = hist / hist.sum()
-            hist_list.append(hist)
+        for i in range(x.size(1)):  # For each channel
+            channel = x[:, i, :]
+            channel_hist = []
 
-        return torch.cat(hist_list)
+            for j in range(self.bins - 1):
+                # Count values in bin range
+                mask = (channel >= values[j]) & (channel < values[j + 1])
+                count = mask.float().sum(dim=1) / channel.size(1)
+                channel_hist.append(count)
 
-    def forward(self, generated, target):
-        gen_hist = self.get_histogram(generated)
+            # Last bin includes upper bound
+            mask = (channel >= values[-1])
+            count = mask.float().sum(dim=1) / channel.size(1)
+            channel_hist.append(count)
+
+            hist.append(torch.stack(channel_hist, dim=1))
+
+        return torch.cat(hist, dim=1)
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        input_hist = self.get_histogram(input)
         target_hist = self.get_histogram(target)
-        return F.kl_div((gen_hist + self.eps).log(), target_hist, reduction='batchmean')
-
-# def get_recommended_hyperparameters():
-#     """Get recommended training hyperparameters"""
-#     return {
-#         'learning_rate': 2e-4,
-#         'batch_size': 1,  # For MPS, increase for CUDA
-#         'adam_betas': (0.5, 0.999),
-#         'lr_scheduler_patience': 3,
-#         'lr_scheduler_factor': 0.5,
-#         'loss_weights': {
-#             'l1': 1.0,
-#             'perceptual': 0.1,
-#             'color_histogram': 0.05
-#         },
-#         'gradient_clip_val': 1.0
-#     }
+        return F.l1_loss(input_hist, target_hist)
