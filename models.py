@@ -150,6 +150,13 @@ class PhotochromGenerator(nn.Module):
         self.debug = debug
         self.tracker = tracker
 
+        def debug_shape(name: str, tensor: torch.Tensor):
+            """Internal helper to log tensor shapes"""
+            if self.debug:
+                logger.debug(f"{name} shape: {tensor.shape}")
+
+        self.debug_shape = debug_shape  # Save as instance method
+
         if self.tracker:
             self.tracker.log_memory("generator_init_start")
 
@@ -231,7 +238,7 @@ class PhotochromGenerator(nn.Module):
             self.tracker.log_memory("generator_forward_start")
             self.tracker.log_tensor("generator_input", x)
 
-        self._debug_shape("Input", x)
+        self.debug_shape("Input", x)  # Use instance method
 
         # Store encoder outputs for skip connections
         encoder_features = []
@@ -241,7 +248,7 @@ class PhotochromGenerator(nn.Module):
             x = stage(x)
             if self.tracker:
                 self.tracker.log_tensor(f"encoder_stage_{i}_output", x)
-            self._debug_shape(f"Encoder stage {i}", x)
+            self.debug_shape(f"Encoder stage {i}", x)  # Use instance method
             encoder_features.append(x)
 
         if self.tracker:
