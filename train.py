@@ -207,7 +207,7 @@ def train_model(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=1,  # Reduced worker count based on warnings
+        num_workers=1,
         pin_memory=True
     )
 
