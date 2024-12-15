@@ -145,7 +145,7 @@ def train_model_ddp(
         world_size: int,
         train_dir: str = "processed_images/synthetic_pairs",
         val_dir: str = "processed_images/real_pairs",
-        batch_size: int = 1,
+        batch_size: int = 8,
         num_epochs: int = 100,
         lr: float = 0.0002,
         image_size: int = 512,

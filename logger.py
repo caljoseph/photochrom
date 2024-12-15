@@ -103,10 +103,16 @@ class TrainingLogger:
             num_samples: int = 4
     ):
         """Save progress images showing model improvement"""
-        # Ensure we're using at most num_samples images
-        bw = bw_images[:num_samples]
-        gen = generated_images[:num_samples]
-        target = target_images[:num_samples]
+
+        # Denormalize images
+        def denorm(x: torch.Tensor) -> torch.Tensor:
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(x.device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(x.device)
+            return x * std + mean
+
+        bw = denorm(bw_images)
+        gen = generated_images
+        target = denorm(target_images)
 
         # Convert UV to RGB if necessary
         if gen.size(1) == 2:  # If UV output
@@ -117,22 +123,13 @@ class TrainingLogger:
             yuv = torch.cat([y, gen], dim=1)
             # Convert to RGB
             gen = self.yuv_to_rgb(yuv)
-
-        # Denormalize images
-        def denorm(x: torch.Tensor) -> torch.Tensor:
-            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(x.device)
-            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(x.device)
-            return x * std + mean
-
-        bw = denorm(bw)
-        gen = denorm(gen)
-        target = denorm(target)
+            gen = denorm(gen)
 
         # Create comparison grid
         comparison = torch.cat([bw, gen, target], dim=0)
         grid = vutils.make_grid(
             comparison,
-            nrow=num_samples,
+            nrow=bw.size(0),  # Use actual batch size instead of num_samples
             padding=2,
             normalize=True,
             value_range=(0, 1)
@@ -165,21 +162,23 @@ class TrainingLogger:
         # Log to tensorboard
         self.writer.add_image('Progress/Comparison', grid, step)
 
-        # Save individual images for analysis
-        for i in range(num_samples):
-            sample_dir = self.analysis_dir / f"sample_{i}"
-            sample_dir.mkdir(exist_ok=True)
+        # Only save individual images if we have samples to save
+        actual_samples = min(bw.size(0), num_samples)
+        if actual_samples > 0:
+            for i in range(actual_samples):
+                sample_dir = self.analysis_dir / f"sample_{i}"
+                sample_dir.mkdir(exist_ok=True)
 
-            # Save each version of the image
-            images = {
-                'input': bw[i],
-                'generated': gen[i],
-                'target': target[i]
-            }
+                # Save each version of the image
+                images = {
+                    'input': bw[i],
+                    'generated': gen[i],
+                    'target': target[i]
+                }
 
-            for name, img in images.items():
-                img_path = sample_dir / f"{name}_step_{step:07d}.png"
-                to_pil_image(img).save(img_path)
+                for name, img in images.items():
+                    img_path = sample_dir / f"{name}_step_{step:07d}.png"
+                    to_pil_image(img).save(img_path)
 
     def log_metrics(
             self,
